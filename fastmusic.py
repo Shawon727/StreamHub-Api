@@ -1,5 +1,4 @@
-# FastMusic — clean stream + catalog (SimpMusic / vivi style)
-# Place next to api.py. Only this file needs music stream fixes.
+# FastMusic — googlevideo only (no savenow / loader.to / ad CDNs)
 from __future__ import annotations
 
 import asyncio
@@ -10,14 +9,25 @@ from typing import Optional, Dict, Any, List, Tuple
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import RedirectResponse, Response, StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 
 router = APIRouter(tags=["FastMusic"])
 
 _CACHE: Dict[str, Any] = {}
-_TTL = 600
+_TTL = 480
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36"
 _UA_YT = "com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip"
+
+# Blocked ad / broken CDNs — never return or proxy these
+_BLOCKED = (
+    "savenow.to",
+    "savenow.",
+    "loader.to",
+    "affadaffa.com",
+    "p.savenow",
+    "byclickdownload",
+    "convertx",
+)
 
 
 def _H():
@@ -33,14 +43,22 @@ def _ok_vid(vid: str) -> bool:
     return bool(re.match(r"^[\w-]{6,20}$", vid or ""))
 
 
+def _blocked(url: str) -> bool:
+    u = (url or "").lower()
+    return any(b in u for b in _BLOCKED)
+
+
+def _is_googlevideo(url: str) -> bool:
+    u = (url or "").lower()
+    return "googlevideo.com" in u or "googleusercontent.com" in u
+
+
 def _thumb_candidates(vid: str) -> List[str]:
-    # HD first, then clean sizes (less letterbox than hqdefault)
     return [
         f"https://i.ytimg.com/vi/{vid}/maxresdefault.jpg",
         f"https://i.ytimg.com/vi/{vid}/hq720.jpg",
         f"https://i.ytimg.com/vi/{vid}/sddefault.jpg",
         f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg",
-        f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg",
     ]
 
 
@@ -58,12 +76,15 @@ def _item(video_id: str, title: str = "", author: str = "", thumb: str = None, d
     }
 
 
-def _best_audio(data: dict) -> Tuple[Optional[str], str, Optional[str], Optional[str]]:
+def _pick_audio(data: dict) -> Tuple[Optional[str], str, Optional[int], str]:
     streams = list(data.get("audio_streams") or [])
     ua = data.get("client_ua") or _UA_YT
 
     def score(a):
-        if not a.get("url"):
+        url = a.get("url") or ""
+        if not url or _blocked(url):
+            return -1
+        if not _is_googlevideo(url) and "youtube.com" not in url:
             return -1
         itag = str(a.get("itag") or "")
         mime = (a.get("mime") or "").lower()
@@ -72,131 +93,224 @@ def _best_audio(data: dict) -> Tuple[Optional[str], str, Optional[str], Optional
         return s
 
     for a in sorted(streams, key=score, reverse=True):
-        if a.get("url"):
-            mime = (a.get("mime") or "").lower()
-            ct = "audio/mp4" if ("mp4" in mime or "mp4a" in mime) else "audio/webm"
-            return a["url"], ct, a.get("contentLength") or data.get("content_length"), ua
-    if data.get("audio_url"):
-        u = data["audio_url"]
-        return u, ("audio/webm" if "webm" in u else "audio/mp4"), data.get("content_length"), ua
+        if score(a) < 0:
+            continue
+        mime = (a.get("mime") or "").lower()
+        ct = "audio/mp4" if ("mp4" in mime or "mp4a" in mime) else "audio/webm"
+        clen = a.get("contentLength") or data.get("content_length")
+        try:
+            clen = int(clen) if clen else None
+        except Exception:
+            clen = None
+        return a["url"], ct, clen, ua
+    url = data.get("audio_url")
+    if url and not _blocked(url) and _is_googlevideo(url):
+        return url, "audio/mp4", data.get("content_length"), ua
     return None, "audio/mp4", None, ua
 
 
-def _best_video(data: dict) -> Tuple[Optional[str], str, Optional[str], Optional[str]]:
+def _pick_video(data: dict) -> Tuple[Optional[str], str, Optional[int], str]:
     streams = list(data.get("video_streams") or [])
     ua = data.get("client_ua") or _UA_YT
-    # progressive or highest with url
-    progressive = [v for v in streams if v.get("url") and v.get("progressive")]
-    if progressive:
-        progressive.sort(key=lambda x: int(x.get("height") or 0), reverse=True)
-        v = progressive[0]
-        return v["url"], "video/mp4", v.get("contentLength"), ua
-    with_url = [v for v in streams if v.get("url")]
-    with_url.sort(key=lambda x: int(x.get("height") or 0), reverse=True)
-    if with_url:
-        v = with_url[0]
+    cand = [v for v in streams if v.get("url") and not _blocked(v["url"]) and _is_googlevideo(v["url"])]
+    cand.sort(key=lambda x: (1 if x.get("progressive") else 0, int(x.get("height") or 0)), reverse=True)
+    if cand:
+        v = cand[0]
         mime = (v.get("mime") or "video/mp4").split(";")[0]
-        return v["url"], mime, v.get("contentLength"), ua
-    if data.get("video_url"):
-        return data["video_url"], "video/mp4", None, ua
+        clen = v.get("contentLength")
+        try:
+            clen = int(clen) if clen else None
+        except Exception:
+            clen = None
+        return v["url"], mime, clen, ua
+    url = data.get("video_url")
+    if url and not _blocked(url) and _is_googlevideo(url):
+        return url, "video/mp4", None, ua
     return None, "video/mp4", None, ua
 
 
-async def _head_len(url: str, ua: str) -> Optional[int]:
+async def _innertube(vid: str) -> dict:
+    """Prefer api helper; local ANDROID/IOS race if needed."""
     try:
-        headers = {"User-Agent": ua or _UA, "Range": "bytes=0-0"}
-        if "googlevideo.com" in url:
-            headers["Referer"] = "https://www.youtube.com/"
-        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as c:
-            r = await c.get(url, headers=headers)
-            cr = r.headers.get("content-range") or ""
-            m = re.search(r"/(\d+)$", cr)
-            if m:
-                return int(m.group(1))
-            if r.headers.get("content-length"):
-                return int(r.headers["content-length"])
+        api = _H()
+        data = await asyncio.wait_for(api._innertube_player(vid, prefer="auto"), timeout=6.0)
+        if data.get("ok"):
+            return data
     except Exception:
         pass
-    return None
+
+    clients = [
+        {
+            "context": {
+                "client": {
+                    "clientName": "ANDROID",
+                    "clientVersion": "20.10.38",
+                    "androidSdkVersion": 34,
+                    "hl": "en",
+                    "gl": "US",
+                }
+            },
+            "ua": _UA_YT,
+            "cn": "3",
+            "name": "ANDROID",
+        },
+        {
+            "context": {
+                "client": {
+                    "clientName": "IOS",
+                    "clientVersion": "20.10.4",
+                    "deviceMake": "Apple",
+                    "deviceModel": "iPhone16,2",
+                    "osName": "iPhone",
+                    "osVersion": "18.2",
+                    "hl": "en",
+                    "gl": "US",
+                }
+            },
+            "ua": "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_2 like Mac OS X)",
+            "cn": "5",
+            "name": "IOS",
+        },
+    ]
+
+    async def one(cl):
+        body = {
+            "context": cl["context"],
+            "videoId": vid,
+            "contentCheckOk": True,
+            "racyCheckOk": True,
+        }
+        headers = {
+            "User-Agent": cl["ua"],
+            "Content-Type": "application/json",
+            "X-YouTube-Client-Name": cl["cn"],
+            "X-YouTube-Client-Version": cl["context"]["client"]["clientVersion"],
+        }
+        try:
+            async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as c:
+                r = await c.post(
+                    "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+                    json=body,
+                    headers=headers,
+                )
+                if r.status_code != 200:
+                    return {"ok": False}
+                j = r.json()
+        except Exception:
+            return {"ok": False}
+        st = (j.get("playabilityStatus") or {}).get("status")
+        if st and st not in ("OK", "LIVE_STREAM_OFFLINE"):
+            return {"ok": False, "error": (j.get("playabilityStatus") or {}).get("reason") or st}
+        sd = j.get("streamingData") or {}
+        formats = list(sd.get("adaptiveFormats") or []) + list(sd.get("formats") or [])
+        audio, video = [], []
+        for f in formats:
+            url = f.get("url")
+            if not url or _blocked(url):
+                continue
+            entry = {
+                "url": url,
+                "itag": f.get("itag"),
+                "mime": f.get("mimeType") or "",
+                "bitrate": f.get("bitrate") or f.get("averageBitrate") or 0,
+                "contentLength": f.get("contentLength"),
+                "approxDurationMs": f.get("approxDurationMs"),
+                "height": f.get("height"),
+                "progressive": "video/" in (f.get("mimeType") or "") and "audio" in (f.get("mimeType") or ""),
+            }
+            mime = entry["mime"]
+            if "audio" in mime and "video" not in mime.split(";")[0]:
+                audio.append(entry)
+            elif "video" in mime:
+                video.append(entry)
+        if not audio and not video:
+            return {"ok": False, "error": "no direct urls"}
+        vd = j.get("videoDetails") or {}
+        duration = None
+        try:
+            duration = int(vd.get("lengthSeconds") or 0) or None
+        except Exception:
+            pass
+        thumbs = (vd.get("thumbnail") or {}).get("thumbnails") or []
+        thumb = thumbs[-1]["url"] if thumbs else f"https://i.ytimg.com/vi/{vid}/hq720.jpg"
+        return {
+            "ok": True,
+            "provider": f"innertube-{cl['name']}",
+            "title": vd.get("title") or vid,
+            "thumb": thumb,
+            "duration": duration,
+            "audio_url": audio[0]["url"] if audio else None,
+            "video_url": video[0]["url"] if video else None,
+            "audio_streams": audio,
+            "video_streams": video,
+            "client_ua": cl["ua"],
+            "content_length": audio[0].get("contentLength") if audio else None,
+        }
+
+    tasks = [asyncio.create_task(one(cl)) for cl in clients]
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED, timeout=6.0)
+    best = None
+    for t in done:
+        try:
+            r = t.result()
+            if r.get("ok") and (r.get("audio_url") or r.get("audio_streams")):
+                best = r
+                break
+        except Exception:
+            pass
+    for t in pending:
+        t.cancel()
+    return best or {"ok": False, "error": "innertube failed"}
 
 
 async def _resolve(vid: str, want_video: bool = False) -> dict:
     now = time.time()
     key = f"{vid}:{'v' if want_video else 'a'}"
     hit = _CACHE.get(key)
-    if hit and now - hit.get("ts", 0) < _TTL and hit.get("url"):
+    if hit and now - hit.get("ts", 0) < _TTL and hit.get("url") and not _blocked(hit["url"]):
         return {"ok": True, **hit}
 
-    api = _H()
-    title, thumb, duration = vid, f"https://i.ytimg.com/vi/{vid}/hq720.jpg", None
-    url = mime = clen = ua = provider = None
+    data = await _innertube(vid)
+    if not data.get("ok"):
+        return {"ok": False, "error": data.get("error") or "stream unavailable (no googlevideo)"}
 
-    try:
-        data = await asyncio.wait_for(api._innertube_player(vid, prefer="auto"), timeout=5.0)
-        if data.get("ok"):
-            title = data.get("title") or title
-            thumb = data.get("thumb") or thumb
-            duration = data.get("duration")
-            if want_video:
-                url, mime, clen, ua = _best_video(data)
-                if not url:
-                    url, mime, clen, ua = _best_audio(data)
-            else:
-                url, mime, clen, ua = _best_audio(data)
-            provider = data.get("provider") or "innertube"
-    except Exception:
-        pass
+    if want_video:
+        url, mime, clen, ua = _pick_video(data)
+        if not url:
+            url, mime, clen, ua = _pick_audio(data)
+    else:
+        url, mime, clen, ua = _pick_audio(data)
 
-    if not url:
-        try:
-            fmt = "mp4" if want_video else "mp3"
-            ld = await api._loader_to_youtube(vid, fmt=fmt)
-            if ld.get("ok") and ld.get("url"):
-                url = ld["url"]
-                title = ld.get("title") or title
-                thumb = ld.get("thumb") or thumb
-                mime = "video/mp4" if want_video else "audio/mpeg"
-                provider = "loader.to"
-                ua = _UA
-                if ld.get("duration"):
-                    duration = ld.get("duration")
-                if ld.get("contentLength") or ld.get("filesize"):
-                    clen = ld.get("contentLength") or ld.get("filesize")
-            else:
-                return {"ok": False, "error": (ld or {}).get("error") or "no stream"}
-        except Exception as e:
-            return {"ok": False, "error": str(e)[:120]}
-
-    if url and not clen:
-        clen = await _head_len(url, ua or _UA)
+    if not url or _blocked(url):
+        return {"ok": False, "error": "no clean googlevideo url (savenow/loader blocked)"}
 
     out = {
         "ok": True,
         "url": url,
-        "mime": mime or ("video/mp4" if want_video else "audio/mp4"),
-        "title": title,
-        "thumb": thumb,
-        "duration": duration,
-        "provider": provider,
+        "mime": mime,
+        "title": data.get("title") or vid,
+        "thumb": data.get("thumb") or f"https://i.ytimg.com/vi/{vid}/hq720.jpg",
+        "duration": data.get("duration"),
+        "provider": data.get("provider") or "innertube",
         "content_length": int(clen) if clen else None,
         "ua": ua or _UA_YT,
         "ts": now,
-        "want_video": want_video,
     }
     _CACHE[key] = out
     return out
 
 
 async def _proxy(url: str, mime: str, request: Request, *, ua: str, content_length=None, duration=None):
-    is_gv = "googlevideo.com" in url
+    if _blocked(url):
+        raise HTTPException(502, "blocked CDN (savenow/loader)")
+    is_gv = _is_googlevideo(url)
     headers = {
         "User-Agent": ua or (_UA_YT if is_gv else _UA),
         "Accept": "*/*",
         "Accept-Encoding": "identity",
-        "Referer": "https://www.youtube.com/" if is_gv else "https://loader.to/",
+        "Referer": "https://www.youtube.com/",
+        "Origin": "https://www.youtube.com",
     }
-    if is_gv:
-        headers["Origin"] = "https://www.youtube.com"
     range_h = request.headers.get("range") or request.headers.get("Range")
     if range_h:
         headers["Range"] = range_h
@@ -225,7 +339,7 @@ async def _proxy(url: str, mime: str, request: Request, *, ua: str, content_leng
     if first[:120].lower().startswith(b"<!doctype") or first[:6].lower().startswith(b"<html"):
         await upstream.aclose()
         await client.aclose()
-        raise HTTPException(502, "html/ad blocked")
+        raise HTTPException(502, "html/ad page")
 
     ct = (upstream.headers.get("content-type") or mime or "audio/mp4").split(";")[0].strip().lower()
     if first[:3] == b"ID3":
@@ -233,7 +347,7 @@ async def _proxy(url: str, mime: str, request: Request, *, ua: str, content_leng
     elif b"ftyp" in first[:32]:
         ct = "video/mp4" if "video" in (mime or "") else "audio/mp4"
     elif "webm" in ct:
-        ct = "video/webm" if "video" in ct else "audio/webm"
+        ct = ct
     elif "mpeg" in ct or "mp3" in ct:
         ct = "audio/mpeg"
     elif "mp4" in ct:
@@ -276,71 +390,53 @@ async def _proxy(url: str, mime: str, request: Request, *, ua: str, content_leng
 
 
 def _crop_letterbox(img_bytes: bytes) -> bytes:
-    """Remove near-black bars (top/bottom or sides) like SimpMusic square cover."""
     try:
         from PIL import Image
-        import numpy as np  # may fail
     except Exception:
-        try:
-            from PIL import Image
-        except Exception:
-            return img_bytes
-        im = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        w, h = im.size
-        # sample rows/cols for blackness
-        px = im.load()
+        return img_bytes
+    im = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    w, h = im.size
+    px = im.load()
 
-        def row_dark(y, thresh=28):
-            s = 0
-            step = max(1, w // 40)
-            for x in range(0, w, step):
-                r, g, b = px[x, y]
-                s += (r + g + b) / 3
-            return (s / max(1, w // step)) < thresh
+    def row_dark(y, thresh=28):
+        step = max(1, w // 40)
+        s = sum(sum(px[x, y][:3]) / 3 for x in range(0, w, step))
+        return (s / max(1, w // step)) < thresh
 
-        def col_dark(x, thresh=28):
-            s = 0
-            step = max(1, h // 40)
-            for y in range(0, h, step):
-                r, g, b = px[x, y]
-                s += (r + g + b) / 3
-            return (s / max(1, h // step)) < thresh
+    def col_dark(x, thresh=28):
+        step = max(1, h // 40)
+        s = sum(sum(px[x, y][:3]) / 3 for y in range(0, h, step))
+        return (s / max(1, h // step)) < thresh
 
-        top = 0
-        while top < h // 3 and row_dark(top):
-            top += 1
-        bot = h - 1
-        while bot > h * 2 // 3 and row_dark(bot):
-            bot -= 1
-        left = 0
-        while left < w // 3 and col_dark(left):
-            left += 1
-        right = w - 1
-        while right > w * 2 // 3 and col_dark(right):
-            right -= 1
-        if bot - top < h // 4 or right - left < w // 4:
-            # fallback center square
-            side = min(w, h)
-            left = (w - side) // 2
-            top = (h - side) // 2
-            right = left + side - 1
-            bot = top + side - 1
-        im = im.crop((left, top, right + 1, bot + 1))
-        # optional square pad/crop to 1:1
-        w2, h2 = im.size
-        side = min(w2, h2)
-        left2 = (w2 - side) // 2
-        top2 = (h2 - side) // 2
-        im = im.crop((left2, top2, left2 + side, top2 + side))
-        if side > 720:
-            im = im.resize((720, 720), Image.LANCZOS)
-        buf = io.BytesIO()
-        im.save(buf, format="JPEG", quality=90, optimize=True)
-        return buf.getvalue()
-    return img_bytes
+    top = 0
+    while top < h // 3 and row_dark(top):
+        top += 1
+    bot = h - 1
+    while bot > h * 2 // 3 and row_dark(bot):
+        bot -= 1
+    left = 0
+    while left < w // 3 and col_dark(left):
+        left += 1
+    right = w - 1
+    while right > w * 2 // 3 and col_dark(right):
+        right -= 1
+    if bot - top < h // 4 or right - left < w // 4:
+        side = min(w, h)
+        left, top = (w - side) // 2, (h - side) // 2
+        right, bot = left + side - 1, top + side - 1
+    im = im.crop((left, top, right + 1, bot + 1))
+    w2, h2 = im.size
+    side = min(w2, h2)
+    left2, top2 = (w2 - side) // 2, (h2 - side) // 2
+    im = im.crop((left2, top2, left2 + side, top2 + side))
+    if side > 720:
+        im = im.resize((720, 720), Image.LANCZOS)
+    buf = io.BytesIO()
+    im.save(buf, format="JPEG", quality=90, optimize=True)
+    return buf.getvalue()
 
 
-# ─── STREAM ────────────────────────────────────────────────────────────────
+# ─── STREAM (googlevideo only) ─────────────────────────────────────────────
 
 @router.get("/stream")
 @router.get("/download")
@@ -349,19 +445,18 @@ def _crop_letterbox(img_bytes: bytes) -> bytes:
 async def stream(
     request: Request,
     id: str = Query(...),
-    type: str = Query("audio", description="audio | video"),
+    type: str = Query("audio"),
     quality: str = Query("best"),
-    json: bool = Query(False, description="true = JSON meta + directUrl"),
-    redirect: bool = Query(False, description="302 to CDN (googlevideo only)"),
-    mp4: bool = Query(False, description="true = video/mp4 stream"),
-    video: bool = Query(False, description="alias of mp4=true"),
+    json: bool = Query(False),
+    redirect: bool = Query(False),
+    mp4: bool = Query(False),
+    video: bool = Query(False),
 ):
     """
-    Play / download YouTube audio or video.
-
-    - json=false → binary stream (ExoPlayer / browser)
-    - json=true  → meta + directUrl + size_mb
-    - mp4=true or type=video → video/mp4 (else audio)
+    YouTube audio/video via googlevideo only.
+    No savenow.to / loader.to links.
+    json=true → directUrl (googlevideo) + size_mb
+    mp4=true → video stream
     """
     vid = _vid(id)
     if not _ok_vid(vid):
@@ -370,9 +465,12 @@ async def stream(
     want_video = bool(mp4 or video or (type or "").lower() in ("video", "mp4"))
     resolved = await _resolve(vid, want_video=want_video)
     if not resolved.get("ok"):
-        raise HTTPException(502, resolved.get("error") or "stream unavailable")
+        raise HTTPException(502, resolved.get("error") or "no clean stream")
 
     url = resolved["url"]
+    if _blocked(url):
+        raise HTTPException(502, "blocked CDN")
+
     mime = resolved.get("mime") or ("video/mp4" if want_video else "audio/mp4")
     clen = resolved.get("content_length")
     ua = resolved.get("ua") or _UA_YT
@@ -380,16 +478,18 @@ async def stream(
     size_mb = round(int(clen) / (1024 * 1024), 2) if clen else None
 
     if json:
+        # Only expose directUrl if it's real googlevideo (not ad CDN)
+        direct = url if _is_googlevideo(url) and not _blocked(url) else None
         return {
             "ok": True,
             "videoId": vid,
             "title": resolved.get("title"),
-            "thumbnail": f"https://movieallshawon.vercel.app/thumbnailHD?id={vid}",
-            "thumbnail_raw": resolved.get("thumb") or f"https://i.ytimg.com/vi/{vid}/hq720.jpg",
-            "url": f"/stream?id={vid}&type={'video' if want_video else 'audio'}&mp4={'true' if want_video else 'false'}",
+            "thumbnail": f"/thumbnailHD?id={vid}",
+            "thumbnail_raw": resolved.get("thumb"),
+            "url": f"/stream?id={vid}&type={'video' if want_video else 'audio'}",
             "play_url": f"/stream?id={vid}&type={'video' if want_video else 'audio'}",
-            "directUrl": url,  # CDN / googlevideo / loader
-            "download_url": url,
+            "directUrl": direct,
+            "download_url": direct,
             "mime": mime,
             "format": "mp4" if want_video else "mp3",
             "duration": duration,
@@ -398,59 +498,30 @@ async def stream(
             "size_mb": size_mb,
             "provider": resolved.get("provider"),
             "seekable": True,
+            "cdn": "googlevideo" if direct else None,
         }
 
-    if redirect and "googlevideo.com" in url:
-        return RedirectResponse(url=url, status_code=302)
-
-    try:
-        return await _proxy(url, mime, request, ua=ua, content_length=clen, duration=duration)
-    except HTTPException as e:
-        if e.status_code in (403, 401) and "googlevideo" in url:
-            _CACHE.pop(f"{vid}:{'v' if want_video else 'a'}", None)
-            api = _H()
-            ld = await api._loader_to_youtube(vid, fmt="mp4" if want_video else "mp3")
-            if ld.get("ok") and ld.get("url"):
-                return await _proxy(
-                    ld["url"],
-                    "video/mp4" if want_video else "audio/mpeg",
-                    request,
-                    ua=_UA,
-                    duration=duration,
-                )
-        raise
+    # never 302 to external — always proxy so ExoPlayer gets stable host + Range
+    return await _proxy(url, mime, request, ua=ua, content_length=clen, duration=duration)
 
 
 @router.get("/player")
 async def player_json(id: str = Query(...)):
     vid = _vid(id)
-    api = _H()
-    data = await api._innertube_player(vid, prefer="auto")
+    data = await _innertube(vid)
     if not data.get("ok"):
-        return {
-            "ok": False,
-            "videoId": vid,
-            "error": data.get("error"),
-            "play_url": f"/stream?id={vid}&type=audio",
-        }
+        return {"ok": False, "videoId": vid, "error": data.get("error"), "play_url": f"/stream?id={vid}"}
     streams = []
     for a in data.get("audio_streams") or []:
-        streams.append({
-            "url": a.get("url"),
-            "itag": a.get("itag"),
-            "mimeType": a.get("mime") or a.get("mimeType"),
-            "bitrate": a.get("bitrate"),
-            "contentLength": a.get("contentLength"),
-            "kind": "audio",
-        })
-    for v in data.get("video_streams") or []:
-        streams.append({
-            "url": v.get("url"),
-            "itag": v.get("itag"),
-            "mimeType": v.get("mime") or v.get("mimeType"),
-            "height": v.get("height"),
-            "kind": "video",
-        })
+        if a.get("url") and not _blocked(a["url"]):
+            streams.append({
+                "url": a["url"] if _is_googlevideo(a["url"]) else None,
+                "itag": a.get("itag"),
+                "mimeType": a.get("mime"),
+                "bitrate": a.get("bitrate"),
+                "contentLength": a.get("contentLength"),
+                "kind": "audio",
+            })
     return {
         "ok": True,
         "videoId": vid,
@@ -460,26 +531,22 @@ async def player_json(id: str = Query(...)):
         "provider": data.get("provider"),
         "streams": streams,
         "play_url": f"/stream?id={vid}&type=audio",
-        "video_url": f"/stream?id={vid}&type=video&mp4=true",
+        "video_url": f"/stream?id={vid}&mp4=true",
     }
 
 
-# ─── THUMBNAIL (HD + crop bars) ────────────────────────────────────────────
-
 @router.get("/thumbnailHD")
 @router.get("/thumbnail")
-async def thumbnail_hd(id: str = Query(...), crop: bool = Query(True), proxy: bool = Query(True)):
+async def thumbnail_hd(id: str = Query(...), crop: bool = Query(True)):
     vid = _vid(id)
     if not _ok_vid(vid):
         raise HTTPException(400, "invalid video id")
-
     async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
         img = None
         for url in _thumb_candidates(vid):
             try:
                 r = await client.get(url, headers={"User-Agent": _UA})
                 if r.status_code == 200 and len(r.content) > 2000:
-                    # maxres sometimes is placeholder small
                     if len(r.content) < 5000 and "maxres" in url:
                         continue
                     img = r.content
@@ -490,9 +557,6 @@ async def thumbnail_hd(id: str = Query(...), crop: bool = Query(True), proxy: bo
             raise HTTPException(404, "thumbnail not found")
         if crop:
             img = _crop_letterbox(img)
-        if not proxy:
-            # still return body (already fetched)
-            pass
         return Response(
             content=img,
             media_type="image/jpeg",
@@ -503,8 +567,6 @@ async def thumbnail_hd(id: str = Query(...), crop: bool = Query(True), proxy: bo
             },
         )
 
-
-# ─── SEARCH / HOME / NEXT ──────────────────────────────────────────────────
 
 @router.get("/search")
 async def search(q: str = Query(..., min_length=1), limit: int = Query(20, ge=1, le=40)):
@@ -598,15 +660,13 @@ async def lyrics(
     title: Optional[str] = Query(None),
     artist: Optional[str] = Query(""),
 ):
-    api = _H()
     query = (q or title or "").strip()
     vid = _vid(id) if id else ""
     if vid and not query:
-        try:
-            pl = await asyncio.wait_for(api._innertube_player(vid), timeout=3.0)
-            if pl.get("ok"):
-                query = pl.get("title") or vid
-        except Exception:
+        data = await _innertube(vid)
+        if data.get("ok"):
+            query = data.get("title") or vid
+        else:
             query = vid
     if not query:
         raise HTTPException(400, "id, q, or title required")
@@ -645,6 +705,7 @@ async def info(id: str = Query(...)):
         "size_mb": round(int(clen) / (1024 * 1024), 2) if clen else None,
         "url": f"/stream?id={vid}&type=audio",
         "play_url": f"/stream?id={vid}&type=audio",
+        "error": None if resolved.get("ok") else resolved.get("error"),
     }
 
 
@@ -653,11 +714,11 @@ async def fm_index():
     return {
         "ok": True,
         "name": "FastMusic",
+        "cdn": "googlevideo only — savenow/loader blocked",
         "stream": {
-            "audio": "GET /stream?id=VIDEO_ID&type=audio",
-            "video_mp4": "GET /stream?id=VIDEO_ID&mp4=true",
-            "json": "GET /stream?id=VIDEO_ID&json=true  → directUrl + size_mb",
-            "seek": "Range bytes → 206",
+            "audio": "GET /stream?id=VIDEO_ID",
+            "video": "GET /stream?id=VIDEO_ID&mp4=true",
+            "json": "GET /stream?id=VIDEO_ID&json=true → directUrl (googlevideo) + size_mb",
         },
         "catalog": ["search", "home", "next", "album", "artist", "lyrics", "thumbnailHD", "info", "player"],
     }
