@@ -1,4 +1,4 @@
-# StreamHub API v7.4.0 — creator: shawon
+# StreamHub API v7.5.0 — creator: shawon
 from __future__ import annotations
 
 import asyncio, base64, hashlib, hmac, json, random, re, time, uuid
@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
-CREATOR, VERSION = "shawon", "7.4.0"
+CREATOR, VERSION = "shawon", "7.5.0"
 app = FastAPI(title="StreamHub API", version=VERSION, docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -222,6 +222,35 @@ async def mb_series(q: str = Query("a", min_length=1), page: int = 1):
     data = await _mb_request("POST", "/wefeed-mobile-bff/subject-api/search/v2", body, token=tok)
     items = _mb_items_from_search(_mb_unwrap(data))
     return ok({"items": items, "count": len(items)}, provider="moviebox", level="primary", endpoint="series", query=q)
+
+
+@app.get("/mb/adult", tags=["MovieBox"])
+async def mb_adult(q: str = Query("sex", min_length=1), page: int = 1):
+    """18+ / Adult content search. Filters results whose genre contains Adult/Erotic/AiAdult."""
+    tok = await _mb_session()
+    body = json.dumps({"keyword": q, "page": page, "perPage": 20, "subjectType": 0})
+    data = await _mb_request("POST", "/wefeed-mobile-bff/subject-api/search/v2", body, token=tok)
+    items = _mb_items_from_search(_mb_unwrap(data))
+    adult_keys = ("adult", "erotic", "aiadult", "hot", "xxx")
+    filtered = []
+    for it in items:
+        g = (it.get("genre") or "").lower()
+        if any(k in g for k in adult_keys):
+            filtered.append(it)
+    # if filter too strict, still return all for this query (often already adult)
+    use = filtered if filtered else items
+    return ok(
+        {"items": use, "count": len(use), "filtered_adult": len(filtered), "total_raw": len(items)},
+        provider="moviebox", level="primary", endpoint="adult", query=q,
+        note="18+ catalog via search; prefer tab 9 home for curated adult shelves.",
+    )
+
+@app.get("/mb/adult/home", tags=["MovieBox"])
+async def mb_adult_home(page: int = 1):
+    """Curated 18+ home — MovieBox tabId=9 (Porn / Adult shelves)."""
+    tok = await _mb_session()
+    data = await _mb_request("GET", f"/wefeed-mobile-bff/tab-operating?page={page}&tabId=9&version=", token=tok)
+    return ok(_mb_unwrap(data), provider="moviebox", level="primary", endpoint="adult_home", tab_id="9")
 
 @app.get("/mb/tab/{tab_id}", tags=["MovieBox"])
 async def mb_tab(tab_id: str, page: int = 1):
@@ -600,8 +629,17 @@ async def _dr_search_raw(q: str, page: int = 1, filter_: str = "all"):
 
 @app.get("/dr/search", tags=["Dramachi"])
 async def dr_search(q: str = Query("a"), page: int = 1, filter: str = Query("all", description="all|movies|series")):
+    q = (q or "a").strip() or "a"
     raw = await _dr_search_raw(q, page, filter)
     data = _dr_normalize(raw)
+    # If empty, try alternate filters / query variants
+    if data["count"] == 0 and filter != "all":
+        raw = await _dr_search_raw(q, page, "all")
+        data = _dr_normalize(raw)
+    if data["count"] == 0 and len(q) > 2:
+        raw = await _dr_search_raw(q[:3], page, "all")
+        data = _dr_normalize(raw)
+        data["note"] = "broadened query prefix"
     return ok(data, provider="dramachi", level="live", endpoint="search", query=q, filter=filter)
 
 @app.get("/dr/home", tags=["Dramachi"])
@@ -793,17 +831,36 @@ async def hc_popular():
               blocked=blocked, note=note)
 
 @app.get("/hc/search", tags=["HentaiCity"])
-async def hc_search(q: str = Query(...)):
-    items, blocked, note = await _hc_fetch_list(f"/search/video/{quote(q)}")
-    if not items or blocked:
-        items2, blocked2, note2 = await _hc_fetch_list(f"/search/?q={quote(q)}")
-        if items2 and not blocked2:
-            items, blocked, note = items2, blocked2, note2
-        elif blocked:
-            # seed still useful for CDN try
-            items = _hc_seed_items()
-            note = note or note2
-            blocked = True
+async def hc_search(q: str = Query(..., min_length=1)):
+    q = q.strip()
+    paths = [
+        f"/search/video/{quote(q)}",
+        f"/search/?q={quote(q)}",
+        f"/search/video/{quote(q.replace(' ', '-'))}",
+        f"/videos/straight/all-recent.html",  # last resort list
+    ]
+    items, blocked, note = [], True, ""
+    for path in paths:
+        items, blocked, note = await _hc_fetch_list(path)
+        if items and not blocked:
+            # if we used recent as fallback, filter by keyword in title
+            if "all-recent" in path:
+                ql = q.lower()
+                filtered = [it for it in items if ql in (it.get("title") or "").lower() or ql in (it.get("id") or "").lower()]
+                if filtered:
+                    items = filtered
+                    note = "filtered from recent list"
+                else:
+                    continue
+            break
+    if blocked or not items:
+        # seed with keyword in title if possible
+        seeds = _hc_seed_items()
+        ql = q.lower()
+        filtered = [s for s in seeds if ql in s["title"].lower()]
+        items = filtered or seeds
+        blocked = True
+        note = note or "HentaiCity HTML blocked or no matches — CDN seed returned. Use folder+vid on /hc/cdn"
     return ok(items, provider="hentaicity", level="private", count=len(items), endpoint="search", query=q,
               blocked=blocked, note=note)
 
@@ -945,7 +1002,7 @@ footer{text-align:center;color:var(--mu);font-size:12px;padding:20px 0 10px}
 </head>
 <body>
 <header class="top">
-  <div class="brand"><div class="logo">SH</div><div><h1>StreamHub API</h1><small>v7.4.0 · creator: shawon</small></div></div>
+  <div class="brand"><div class="logo">SH</div><div><h1>StreamHub API</h1><small>v7.5.0 · creator: shawon</small></div></div>
   <div class="search"><span style="opacity:.4;font-size:13px">⌕</span><input id="q" placeholder="Filter endpoints…" oninput="filt()"/></div>
 </header>
 <div class="tabs" id="tabs"></div>
@@ -959,7 +1016,10 @@ const API = location.origin;
 const E = [
 {g:'MovieBox',p:'/mb/search',how:'Search all titles. Copy <code>subjectId</code> for play/detail.',params:[{n:'q',v:'avatar'},{n:'page',v:'1'}]},
 {g:'MovieBox',p:'/mb/movies',how:'Movies only (subjectType=1).',params:[{n:'q',v:'love'},{n:'page',v:'1'}]},
-{g:'MovieBox',p:'/mb/series',how:'Series only (subjectType=2).',params:[{n:'q',v:'love'},{n:'page',v:'1'}]},
+{g:'MovieBox',p:'/mb/series',how:'Series only (subjectType=2).',params:[{n:'q',v:'love'},
+{g:'MovieBox',p:'/mb/adult',how:'18+ search. Genre filtered Adult/Erotic. Default q=sex.',params:[{n:'q',v:'sex'},{n:'page',v:'1'}]},
+{g:'MovieBox',p:'/mb/adult/home',how:'Curated adult home (tabId=9 — Porn Top Videos shelves).',params:[{n:'page',v:'1'}]},
+{n:'page',v:'1'}]},
 {g:'MovieBox',p:'/mb/play/{id}',how:'Returns MP4 + DASH. For DASH send the <code>cookie</code> header. Series: add se & ep.',params:[{n:'id',v:'1654274595068805784',path:true},{n:'se',v:''},{n:'ep',v:''}]},
 {g:'MovieBox',p:'/mb/detail/{id}',how:'Full metadata for a subjectId.',params:[{n:'id',v:'1654274595068805784',path:true}]},
 {g:'MovieBox',p:'/mb/resource/{id}',how:'Extra resource/download links.',params:[{n:'id',v:'1654274595068805784',path:true}]},
