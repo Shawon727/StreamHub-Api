@@ -1,4 +1,4 @@
-# StreamHub API v7.2.0 — fixed MovieBox + 4K CDN chain + modern docs — creator: shawon
+# StreamHub API v7.3.0 — fixed MovieBox + 4K CDN chain + modern docs — creator: shawon
 from __future__ import annotations
 
 import asyncio, base64, hashlib, hmac, json, random, re, time, uuid
@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
-CREATOR, VERSION = "shawon", "7.2.0"
+CREATOR, VERSION = "shawon", "7.3.0"
 app = FastAPI(title="StreamHub API", version=VERSION, docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -351,6 +351,60 @@ async def _resolve_greenmotors(gm_url):
             return await _resolve_hubdrive(target)
         return [{"label": "Direct", "url": _pixeldrain_api(target) or target, "kind": "direct"}]
 
+
+@app.get("/mb/movies", tags=["MovieBox"])
+async def mb_movies(q: str = Query("a", min_length=1), page: int = 1):
+    """Search limited to movies (subjectType=1)."""
+    tok = await _mb_session()
+    body = json.dumps({"keyword": q, "page": page, "perPage": 20, "subjectType": 1})
+    data = await _mb_request("POST", "/wefeed-mobile-bff/subject-api/search/v2", body, token=tok)
+    inner = _mb_unwrap(data)
+    items = []
+    for block in inner.get("results") or []:
+        for s in block.get("subjects") or []:
+            if s.get("subjectType") not in (1, None, "1"):
+                # still include if API ignores filter
+                pass
+            cover = s.get("cover")
+            items.append({
+                "subjectId": s.get("subjectId") or s.get("id"),
+                "title": s.get("title"),
+                "type": s.get("subjectType"),
+                "year": (s.get("releaseDate") or "")[:4],
+                "genre": s.get("genre"),
+                "cover": cover.get("url") if isinstance(cover, dict) else cover,
+            })
+    return ok({"items": items, "count": len(items)}, provider="moviebox", level="primary", endpoint="movies", query=q)
+
+@app.get("/mb/series", tags=["MovieBox"])
+async def mb_series(q: str = Query("a", min_length=1), page: int = 1):
+    """Search limited to series (subjectType=2)."""
+    tok = await _mb_session()
+    body = json.dumps({"keyword": q, "page": page, "perPage": 20, "subjectType": 2})
+    data = await _mb_request("POST", "/wefeed-mobile-bff/subject-api/search/v2", body, token=tok)
+    inner = _mb_unwrap(data)
+    items = []
+    for block in inner.get("results") or []:
+        for s in block.get("subjects") or []:
+            cover = s.get("cover")
+            items.append({
+                "subjectId": s.get("subjectId") or s.get("id"),
+                "title": s.get("title"),
+                "type": s.get("subjectType"),
+                "year": (s.get("releaseDate") or "")[:4],
+                "genre": s.get("genre"),
+                "cover": cover.get("url") if isinstance(cover, dict) else cover,
+            })
+    return ok({"items": items, "count": len(items)}, provider="moviebox", level="primary", endpoint="series", query=q)
+
+@app.get("/mb/tab/{tab_id}", tags=["MovieBox"])
+async def mb_tab(tab_id: str, page: int = 1):
+    """Homepage tabs: 1=home, 2=movies-ish, 3=series-ish, 4=charts (try 1-4)."""
+    tok = await _mb_session()
+    path = f"/wefeed-mobile-bff/tab-operating?page={page}&tabId={tab_id}&version="
+    data = await _mb_request("GET", path, token=tok)
+    return ok(_mb_unwrap(data), provider="moviebox", level="primary", endpoint="tab", tab_id=tab_id)
+
 @app.get("/fk/home", tags=["4KHDHub"])
 async def fk_home():
     async with _client() as client:
@@ -469,6 +523,35 @@ async def dr_home(page: int = 1):
         except Exception: data = {"raw": r.text[:1500]}
     return ok(data, provider="dramachi", level="live", endpoint="home")
 
+@app.get("/dr/detail", tags=["Dramachi"])
+async def dr_detail(id: str = Query(...), content: str = Query("movies")):
+    """Try common detail interfaces (upstream often returns null — no public stream API)."""
+    results = {}
+    async with _client() as client:
+        for iface in ("detail", "info", "get", "movie", "play", "stream", "sources", "watch"):
+            try:
+                r = await client.get(f"{DR_BASE}/", params={"interface": iface, "id": id, "content": content})
+                if r.text and r.text.strip() not in ("null", ""):
+                    try:
+                        results[iface] = r.json()
+                    except Exception:
+                        results[iface] = r.text[:500]
+            except Exception as e:
+                results[iface] = {"error": str(e)}
+    has = {k: v for k, v in results.items() if v and v != "null"}
+    return ok(
+        {"id": id, "content": content, "available": has, "all": results},
+        provider="dramachi",
+        level="live",
+        endpoint="detail",
+        note="Dramachi public API exposes search/list; stream CDN is not published. Use search results thumb via static.nodeobjects.com/thumbnail/{thumb}",
+    )
+
+@app.get("/dr/thumb", tags=["Dramachi"])
+async def dr_thumb(name: str = Query(..., description="thumb filename from search, e.g. godlovescaviar2012h.jpg")):
+    url = f"https://static.nodeobjects.com/thumbnail/{name}"
+    return ok({"thumb": name, "url": url}, provider="dramachi", level="live", endpoint="thumb")
+
 IPTV_SOURCES = [
     "https://iptv-org.github.io/iptv/index.m3u",
     "https://iptv-org.github.io/iptv/countries/bd.m3u",
@@ -502,80 +585,187 @@ async def iptv_channels(source: int = 0, q: Optional[str] = None, limit: int = 5
 
 HC_BASE = "https://www.hentaicity.com"
 
-def _hc_list(html):
-    soup = BeautifulSoup(html, "html.parser"); items = []; seen = set()
+def _hc_cdn(folder: str, vid: str) -> dict:
+    """Build all direct stream URLs from folder/id (no page fetch needed)."""
+    base_flv = f"https://www.hentaicity.com/flv/{folder}/{vid}"
+    hls = (
+        f"https://hls.hentaicity.com/_hls/flv/{folder}/{vid}/"
+        f",default,mobile,480p,720p,1080p,.mp4.urlset/master.m3u8"
+    )
+    return {
+        "folder": folder,
+        "video_id": vid,
+        "hls": hls,
+        "mp4": {
+            "mobile": f"{base_flv}/mobile.mp4",
+            "default": f"{base_flv}/default.mp4",
+            "480p": f"{base_flv}/480p.mp4",
+            "720p": f"{base_flv}/720p.mp4",
+            "1080p": f"{base_flv}/1080p.mp4",
+        },
+        "poster": f"https://cdn1.images.hentaicity.com/videos/{folder}/{vid}/main.jpg",
+        "poster_hd": f"https://cdn1.images.hentaicity.com/videos/{folder}/{vid}/1080p.jpg",
+        "trailer": f"https://cdn1.hentaicity.com/{folder}/{vid}/trailer.mp4",
+    }
+
+def _hc_list(html: str) -> list:
+    soup = BeautifulSoup(html, "html.parser")
+    items = []
+    seen = set()
     for a in soup.select("a[href]"):
         href = a.get("href") or ""
         m = re.search(r"/video/([^/]+\.html)", href)
-        if not m: continue
-        if "all-" in href: continue
-        slug = m.group(1); vid_id = slug.rsplit(".", 1)[0]
-        if vid_id in seen: continue
-        seen.add(vid_id)
-        title = (a.get("title") or "").strip() or " ".join(a.get_text().split())
+        if not m or "all-" in href:
+            continue
+        slug = m.group(1)
+        vid_key = slug.rsplit(".", 1)[0]
+        if vid_key in seen:
+            continue
+        seen.add(vid_key)
         img = a.find("img")
         poster = None
-        if img: poster = img.get("src") or img.get("data-src") or img.get("data-original")
+        folder = vid_num = None
+        if img:
+            poster = img.get("src") or img.get("data-src") or img.get("data-original")
+            if poster:
+                fm = re.search(r"/videos/(\d+)/(\d+)/", poster)
+                if fm:
+                    folder, vid_num = fm.group(1), fm.group(2)
+        title = (a.get("title") or "").strip()
+        if not title and img:
+            title = (img.get("alt") or img.get("title") or "").strip()
+        if not title:
+            title = " ".join(a.get_text().split())
+        if not title or (len(title) <= 8 and any(ch.isdigit() for ch in title)):
+            title = vid_key.replace("-", " ")[:90]
         full = href if href.startswith("http") else urljoin(HC_BASE, href)
-        items.append({"id": vid_id, "slug": slug, "title": title or vid_id, "url": full, "poster": poster})
+        item = {
+            "id": vid_key,
+            "slug": slug,
+            "title": title or vid_key,
+            "url": full,
+            "poster": poster,
+            "folder": folder,
+            "numeric_id": vid_num,
+        }
+        if folder and vid_num:
+            item["streams"] = _hc_cdn(folder, vid_num)
+        items.append(item)
     return items
 
-def _hc_stream_from_html(html):
+def _hc_stream_from_html(html: str) -> list:
     sources = []
     for m in re.findall(r'https?://hls\.hentaicity\.com/[^"\'\s<>]+', html):
         sources.append({"src": m, "format": "hls", "cdn": "hls.hentaicity.com"})
-    for m in re.findall(r'https?://cdn\d*\.hentaicity\.com/[^"\'\s<>]+\.mp4[^"\'\s<>]*', html):
-        sources.append({"src": m, "format": "mp4", "cdn": "cdn.hentaicity.com"})
+    for m in re.findall(r'https?://(?:www\.)?hentaicity\.com/flv/\d+/\d+/[^"\'\s<>]+\.mp4', html):
+        sources.append({"src": m, "format": "mp4", "cdn": "hentaicity.com"})
+    fm = re.search(r"/flv/(\d+)/(\d+)/", html) or re.search(r"/videos/(\d+)/(\d+)/", html)
+    if fm:
+        cdn = _hc_cdn(fm.group(1), fm.group(2))
+        sources.insert(0, {"src": cdn["hls"], "format": "hls", "cdn": "hls.hentaicity.com"})
+        for q, u in cdn["mp4"].items():
+            sources.append({"src": u, "format": "mp4", "quality": q, "cdn": "hentaicity.com"})
     seen = set(); out = []
     for s in sources:
-        if s["src"] in seen: continue
+        if s["src"] in seen:
+            continue
         seen.add(s["src"]); out.append(s)
     return out
 
 @app.get("/hc/recent", tags=["HentaiCity"])
 async def hc_recent():
     async with _client() as client:
-        r = await client.get(f"{HC_BASE}/videos/straight/all-recent.html",
-            headers={"Referer": "https://www.google.com/", "User-Agent": UA})
+        r = await client.get(
+            f"{HC_BASE}/videos/straight/all-recent.html",
+            headers={"Referer": "https://www.google.com/", "User-Agent": UA},
+        )
         items = _hc_list(r.text)
     return ok(items, provider="hentaicity", level="private", count=len(items), endpoint="recent")
 
 @app.get("/hc/popular", tags=["HentaiCity"])
 async def hc_popular():
     async with _client() as client:
-        r = await client.get(f"{HC_BASE}/videos/straight/all-popular.html",
-            headers={"Referer": "https://www.google.com/", "User-Agent": UA})
+        r = await client.get(
+            f"{HC_BASE}/videos/straight/all-popular.html",
+            headers={"Referer": "https://www.google.com/", "User-Agent": UA},
+        )
         items = _hc_list(r.text)
     return ok(items, provider="hentaicity", level="private", count=len(items), endpoint="popular")
 
 @app.get("/hc/search", tags=["HentaiCity"])
 async def hc_search(q: str = Query(...)):
     async with _client() as client:
-        r = await client.get(f"{HC_BASE}/search/", params={"q": q},
-            headers={"Referer": HC_BASE + "/", "User-Agent": UA})
-        items = _hc_list(r.text)
+        # primary search path from research
+        for path, params in [
+            (f"{HC_BASE}/search/video/{q}", None),
+            (f"{HC_BASE}/search/", {"q": q}),
+        ]:
+            r = await client.get(path, params=params, headers={"Referer": HC_BASE + "/", "User-Agent": UA})
+            items = _hc_list(r.text)
+            if items:
+                break
     return ok(items, provider="hentaicity", level="private", count=len(items), endpoint="search", query=q)
 
 @app.get("/hc/watch", tags=["HentaiCity"])
-async def hc_watch(id: Optional[str] = None, url: Optional[str] = None):
+async def hc_watch(
+    id: Optional[str] = None,
+    url: Optional[str] = None,
+    folder: Optional[str] = None,
+    vid: Optional[str] = Query(None, description="numeric video id inside folder"),
+):
+    """Resolve HLS + all MP4 qualities. Prefer folder+vid if known (works even when HTML is blocked)."""
+    if folder and vid:
+        cdn = _hc_cdn(folder, vid)
+        sources = [{"src": cdn["hls"], "format": "hls"}] + [
+            {"src": u, "format": "mp4", "quality": q} for q, u in cdn["mp4"].items()
+        ]
+        return ok(
+            {"id": id, "folder": folder, "vid": vid, "streams": cdn, "sources": sources, "count": len(sources)},
+            provider="hentaicity", level="private", endpoint="watch",
+        )
     if not id and not url:
-        raise HTTPException(400, detail=fail("id or url required"))
+        raise HTTPException(400, detail=fail("Provide id, url, or folder+vid"))
     pages = []
-    if url: pages.append(url)
+    if url:
+        pages.append(url)
     if id:
-        pages += [f"{HC_BASE}/video/{id}.html", f"{HC_BASE}/click/1-1/video/{id}.html"]
-    html = ""; final = pages[0]
+        pages += [
+            f"{HC_BASE}/video/{id}.html",
+            f"{HC_BASE}/click/1-1/video/{id}.html",
+        ]
+    html = ""
+    final = pages[0]
     async with _client() as client:
         for page in pages:
             r = await client.get(page, headers={"Referer": HC_BASE + "/", "User-Agent": UA})
-            html = r.text; final = str(r.url)
-            if _hc_stream_from_html(html): break
+            html = r.text
+            final = str(r.url)
+            if "defendonlineprivacy" in final or "defendonlineprivacy" in html:
+                continue
+            if _hc_stream_from_html(html) or re.search(r"/flv/(\d+)/(\d+)/", html):
+                break
     soup = BeautifulSoup(html, "html.parser")
     title_el = soup.select_one("h1") or soup.select_one("title")
     title = title_el.get_text(strip=True) if title_el else id
     sources = _hc_stream_from_html(html)
-    return ok({"id": id, "title": title, "page": final, "sources": sources, "count": len(sources)},
-        provider="hentaicity", level="private", endpoint="watch")
+    fm = re.search(r"/flv/(\d+)/(\d+)/", html) or re.search(r"/videos/(\d+)/(\d+)/", html)
+    streams = _hc_cdn(fm.group(1), fm.group(2)) if fm else None
+    if not sources and not streams:
+        return ok(
+            {"id": id, "title": title, "page": final, "sources": [], "count": 0,
+             "hint": "HTML blocked on this IP. Use /hc/recent item.streams or /hc/watch?folder=&vid="},
+            provider="hentaicity", level="private", endpoint="watch",
+        )
+    return ok(
+        {"id": id, "title": title, "page": final, "sources": sources, "streams": streams, "count": len(sources)},
+        provider="hentaicity", level="private", endpoint="watch",
+    )
+
+@app.get("/hc/cdn", tags=["HentaiCity"])
+async def hc_cdn(folder: str = Query(...), vid: str = Query(...)):
+    """Direct CDN builder — no scrape. folder+vid from /hc/recent item."""
+    cdn = _hc_cdn(folder, vid)
+    return ok(cdn, provider="hentaicity", level="private", endpoint="cdn")
 
 @app.get("/search", tags=["Aggregate"])
 async def aggregate_search(q: str = Query(..., min_length=1)):
@@ -611,66 +801,60 @@ DOCS_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
-<title>StreamHub API</title>
-<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<title>StreamHub API · shawon</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet"/>
 <style>
-:root{
-  --bg:#09090b;--s1:#18181b;--s2:#27272a;--bd:#3f3f46;--tx:#fafafa;--mu:#a1a1aa;
-  --ac:#8b5cf6;--ac2:#22d3ee;--ok:#34d399;--radius:12px;
-}
+:root{--bg:#09090b;--s1:#141416;--s2:#1c1c1f;--bd:#2e2e33;--tx:#f4f4f5;--mu:#a1a1aa;--ac:#a78bfa;--cy:#22d3ee;--ok:#34d399}
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:Inter,system-ui,sans-serif;background:var(--bg);color:var(--tx);min-height:100vh;line-height:1.5}
-a{color:var(--ac2);text-decoration:none}
-.layout{display:grid;grid-template-columns:260px 1fr;min-height:100vh}
-@media(max-width:900px){.layout{grid-template-columns:1fr}.side{display:none}.mob{display:flex!important}}
-.side{background:var(--s1);border-right:1px solid var(--bd);padding:20px 16px;position:sticky;top:0;height:100vh;overflow:auto}
-.logo{display:flex;align-items:center;gap:10px;margin-bottom:24px;padding:0 8px}
-.logo-mark{width:36px;height:36px;border-radius:10px;background:linear-gradient(135deg,#8b5cf6,#22d3ee);display:grid;place-items:center;font-weight:700;font-size:14px}
-.logo h1{font-size:16px;font-weight:700}.logo span{font-size:11px;color:var(--mu)}
-.nav-label{font-size:11px;font-weight:600;color:var(--mu);text-transform:uppercase;letter-spacing:.06em;padding:12px 8px 6px}
-.nav a{display:block;padding:8px 10px;border-radius:8px;color:var(--mu);font-size:13px;font-weight:500;margin-bottom:2px}
-.nav a:hover,.nav a.on{background:var(--s2);color:var(--tx)}
-.main{padding:28px 32px 80px;max-width:920px}
-.mob{display:none;gap:8px;flex-wrap:wrap;margin-bottom:16px}
-.pill{font-size:12px;padding:6px 12px;border-radius:999px;background:var(--s1);border:1px solid var(--bd);color:var(--mu)}
-.pill.v{color:#c4b5fd;border-color:#7c3aed55}
-.hero{margin-bottom:28px}
-.hero h2{font-size:28px;font-weight:700;letter-spacing:-.03em;margin-bottom:8px}
-.hero p{color:var(--mu);font-size:15px;max-width:560px}
-.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:20px 0 28px}
-@media(max-width:600px){.stats{grid-template-columns:1fr 1fr}.main{padding:20px 16px 60px}}
-.stat{background:var(--s1);border:1px solid var(--bd);border-radius:var(--radius);padding:14px}
-.stat b{font-size:20px;display:block}.stat span{font-size:12px;color:var(--mu)}
-.search{display:flex;align-items:center;gap:10px;background:var(--s1);border:1px solid var(--bd);border-radius:10px;padding:10px 14px;margin-bottom:20px}
+body{font-family:Inter,system-ui,sans-serif;background:var(--bg);color:var(--tx);min-height:100vh;
+background-image:radial-gradient(ellipse 90% 60% at 10% -10%,rgba(167,139,250,.22),transparent),radial-gradient(ellipse 70% 50% at 100% 0%,rgba(34,211,238,.12),transparent)}
+a{color:var(--cy)}.layout{display:grid;grid-template-columns:250px 1fr;min-height:100vh}
+@media(max-width:860px){.layout{grid-template-columns:1fr}.side{position:relative;height:auto;border-right:0;border-bottom:1px solid var(--bd)}}
+.side{background:rgba(20,20,22,.9);backdrop-filter:blur(12px);border-right:1px solid var(--bd);padding:18px 14px;position:sticky;top:0;height:100vh;overflow:auto}
+.logo{display:flex;gap:10px;align-items:center;margin-bottom:20px;padding:4px 6px}
+.mark{width:38px;height:38px;border-radius:11px;background:linear-gradient(135deg,#a78bfa,#22d3ee);display:grid;place-items:center;font-weight:700;font-size:13px;animation:pulse 3s ease infinite}
+@keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(167,139,250,.35)}50%{box-shadow:0 0 24px 4px rgba(167,139,250,.25)}}
+.logo h1{font-size:15px;font-weight:700}.logo small{color:var(--mu);font-size:11px}
+.nav-label{font-size:10px;font-weight:600;color:var(--mu);text-transform:uppercase;letter-spacing:.07em;padding:14px 8px 6px}
+.nav a{display:block;padding:8px 10px;border-radius:8px;color:var(--mu);font-size:13px;font-weight:500;margin-bottom:2px;transition:.15s}
+.nav a:hover{background:var(--s2);color:var(--tx);transform:translateX(3px)}
+.main{padding:28px 28px 70px;max-width:900px}
+.hero h2{font-size:26px;font-weight:700;letter-spacing:-.03em;margin-bottom:6px}
+.hero p{color:var(--mu);font-size:14px;margin-bottom:18px}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:20px}
+@media(max-width:600px){.stats{grid-template-columns:1fr 1fr}.main{padding:18px 14px 50px}}
+.stat{background:var(--s1);border:1px solid var(--bd);border-radius:12px;padding:12px 14px;transition:.2s}
+.stat:hover{border-color:#a78bfa66;transform:translateY(-2px)}
+.stat b{font-size:18px;display:block}.stat span{font-size:11px;color:var(--mu)}
+.search{display:flex;gap:8px;align-items:center;background:var(--s1);border:1px solid var(--bd);border-radius:10px;padding:10px 12px;margin-bottom:16px;transition:.2s}
+.search:focus-within{border-color:#a78bfa88;box-shadow:0 0 0 3px #a78bfa22}
 .search input{flex:1;border:0;outline:0;background:transparent;color:var(--tx);font:inherit;font-size:14px}
-.ep{background:var(--s1);border:1px solid var(--bd);border-radius:var(--radius);margin-bottom:10px;overflow:hidden;transition:.15s}
-.ep:hover{border-color:#8b5cf688}
-.ep-head{display:flex;align-items:center;gap:12px;padding:14px 16px;cursor:pointer}
-.method{font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;padding:3px 8px;border-radius:6px;background:#22d3ee22;color:#22d3ee}
-.ep-path{font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:500;flex:1}
-.ep-desc{font-size:13px;color:var(--mu);display:none}
-@media(min-width:700px){.ep-desc{display:block;max-width:280px;text-align:right}}
-.ep-body{display:none;padding:0 16px 16px;border-top:1px solid var(--bd)}
-.ep.open .ep-body{display:block;padding-top:14px}
-.row{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px}
-.field{flex:1;min-width:140px;background:var(--bg);border:1px solid var(--bd);border-radius:8px;padding:10px 12px;color:var(--tx);font:inherit;font-size:13px;font-family:'JetBrains Mono',monospace}
-.btn{background:var(--ac);border:0;color:#fff;padding:10px 16px;border-radius:8px;font-weight:600;font-size:13px;cursor:pointer}
-.btn:hover{filter:brightness(1.1)}
-.ghost{background:transparent;border:1px solid var(--bd);color:var(--tx);padding:10px 12px;border-radius:8px;cursor:pointer;font-size:13px}
-pre{background:#000;border:1px solid var(--bd);border-radius:8px;padding:12px;overflow:auto;max-height:380px;font-family:'JetBrains Mono',monospace;font-size:12px;line-height:1.55;color:#e4e4e7;white-space:pre-wrap}
-.hint{font-size:12px;color:var(--mu);margin:8px 0}
-.sec{font-size:13px;font-weight:600;color:var(--mu);text-transform:uppercase;letter-spacing:.05em;margin:28px 0 12px}
-footer{margin-top:40px;padding-top:20px;border-top:1px solid var(--bd);font-size:13px;color:var(--mu);text-align:center}
-</style>
-</head>
+.sec{font-size:12px;font-weight:600;color:var(--mu);text-transform:uppercase;letter-spacing:.06em;margin:22px 0 10px}
+.ep{background:var(--s1);border:1px solid var(--bd);border-radius:12px;margin-bottom:8px;overflow:hidden;transition:.2s;animation:fadeUp .35s ease both}
+.ep:hover{border-color:#a78bfa55}
+@keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+.ep-head{display:flex;align-items:center;gap:10px;padding:12px 14px;cursor:pointer;user-select:none}
+.method{font-family:JetBrains Mono,monospace;font-size:10px;font-weight:600;padding:3px 7px;border-radius:5px;background:#22d3ee18;color:var(--cy)}
+.path{font-family:JetBrains Mono,monospace;font-size:12.5px;font-weight:500;flex:1}
+.chev{color:var(--mu);transition:.2s;font-size:12px}.ep.open .chev{transform:rotate(90deg)}
+.ep-body{display:none;padding:0 14px 14px;border-top:1px solid var(--bd)}
+.ep.open .ep-body{display:block;animation:fadeUp .25s ease}
+.how{background:var(--bg);border:1px solid var(--bd);border-radius:8px;padding:10px 12px;margin:10px 0;font-size:12.5px;color:var(--mu);line-height:1.55}
+.how b{color:var(--tx)}.how code{font-family:JetBrains Mono,monospace;font-size:11px;color:var(--ac);background:#a78bfa15;padding:1px 5px;border-radius:4px}
+.row{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}
+.field{flex:1;min-width:120px;background:var(--bg);border:1px solid var(--bd);border-radius:8px;padding:9px 11px;color:var(--tx);font:inherit;font-size:12px;font-family:JetBrains Mono,monospace}
+.btn{background:linear-gradient(135deg,#8b5cf6,#7c3aed);border:0;color:#fff;padding:9px 14px;border-radius:8px;font-weight:600;font-size:12px;cursor:pointer;transition:.15s}
+.btn:hover{filter:brightness(1.1);transform:translateY(-1px)}.ghost{background:transparent;border:1px solid var(--bd);color:var(--tx);padding:9px 12px;border-radius:8px;cursor:pointer;font-size:12px}
+pre{background:#000;border:1px solid var(--bd);border-radius:8px;padding:11px;overflow:auto;max-height:360px;font-family:JetBrains Mono,monospace;font-size:11.5px;line-height:1.5;color:#e4e4e7;white-space:pre-wrap}
+footer{margin-top:36px;padding-top:16px;border-top:1px solid var(--bd);font-size:12px;color:var(--mu);text-align:center}
+</style></head>
 <body>
 <div class="layout">
 <aside class="side">
-  <div class="logo"><div class="logo-mark">SH</div><div><h1>StreamHub</h1><span>API · shawon</span></div></div>
+  <div class="logo"><div class="mark">SH</div><div><h1>StreamHub</h1><small>v7.3.0 · shawon</small></div></div>
   <div class="nav-label">Providers</div>
   <nav class="nav">
-    <a href="#MovieBox" class="on">MovieBox</a>
+    <a href="#MovieBox">MovieBox</a>
     <a href="#4KHDHub">4KHDHub</a>
     <a href="#Tools">Tools / CDN</a>
     <a href="#Dramachi">Dramachi</a>
@@ -678,100 +862,82 @@ footer{margin-top:40px;padding-top:20px;border-top:1px solid var(--bd);font-size
     <a href="#HentaiCity">HentaiCity</a>
     <a href="#Aggregate">Aggregate</a>
   </nav>
-  <div class="nav-label">Meta</div>
-  <nav class="nav"><a href="/health">Health</a></nav>
 </aside>
 <main class="main">
-  <div class="mob">
-    <span class="pill v">v7.2.0</span>
-    <span class="pill">creator: shawon</span>
-  </div>
   <div class="hero">
     <h2>API Reference</h2>
-    <p>MovieBox DASH/MP4 · 4K HubCloud R2 CDN · IPTV · Drama · HentaiCity HLS. Every response includes <code>creator: "shawon"</code>.</p>
+    <p>Expand any endpoint → read how it works → edit URL → <b>Try it</b>. All JSON includes <code>creator: "shawon"</code>.</p>
   </div>
   <div class="stats">
     <div class="stat"><b id="n">0</b><span>Endpoints</span></div>
     <div class="stat"><b>6</b><span>Providers</span></div>
-    <div class="stat"><b>CDN</b><span>R2 · DASH · HLS</span></div>
+    <div class="stat"><b>CDN</b><span>R2 · DASH · HLS · MP4</span></div>
     <div class="stat"><b>JSON</b><span>Clean responses</span></div>
   </div>
-  <div class="search"><span style="opacity:.4">/</span><input id="q" placeholder="Filter endpoints…" oninput="filt()"/></div>
+  <div class="search"><span style="opacity:.35">/</span><input id="q" placeholder="Filter endpoints…" oninput="filt()"/></div>
   <div id="list"></div>
-  <footer>StreamHub API · made by shawon · MovieBox-TUI compatible resolve chain</footer>
+  <footer>StreamHub API · made by shawon</footer>
 </main>
 </div>
 <script>
 const API=location.origin;
 const E=[
-{g:'MovieBox',m:'GET',p:'/mb/search',d:'Search movies & series',t:'/mb/search?q=avatar'},
-{g:'MovieBox',m:'GET',p:'/mb/play/{id}',d:'MP4 + DASH streams (with Cookie)',t:'/mb/play/1654274595068805784'},
-{g:'MovieBox',m:'GET',p:'/mb/detail/{id}',d:'Title metadata',t:'/mb/detail/1654274595068805784'},
-{g:'MovieBox',m:'GET',p:'/mb/resource/{id}',d:'Extra resource links',t:'/mb/resource/1654274595068805784'},
-{g:'MovieBox',m:'GET',p:'/mb/home',d:'Home tabs',t:'/mb/home'},
-{g:'MovieBox',m:'GET',p:'/mb/seasons/{id}',d:'Season list',t:'/mb/seasons/1654274595068805784'},
-{g:'4KHDHub',m:'GET',p:'/fk/home',d:'Latest catalog',t:'/fk/home'},
-{g:'4KHDHub',m:'GET',p:'/fk/search',d:'Search catalog',t:'/fk/search?q=avatar'},
-{g:'4KHDHub',m:'GET',p:'/fk/detail',d:'Releases + mirrors',t:'/fk/detail?path=/hacksaw-ridge-movie-7809/'},
-{g:'4KHDHub',m:'GET',p:'/fk/stream',d:'Resolve to R2/PixelDrain CDN',t:'/fk/stream?path=/hacksaw-ridge-movie-7809/&resolve=true'},
-{g:'4KHDHub',m:'GET',p:'/fk/category/{slug}',d:'Category browse',t:'/fk/category/movies'},
-{g:'Tools',m:'GET',p:'/tools/resolve',d:'HubCloud/GreenMotors → direct CDN',t:'/tools/resolve?url=https://hubcloud.ist/drive/1qg90m0nr2599rq'},
-{g:'Tools',m:'GET',p:'/tools/pixeldrain',d:'PixelDrain download URL',t:'/tools/pixeldrain?id=GauktM6T'},
-{g:'Dramachi',m:'GET',p:'/dr/search',d:'Drama search',t:'/dr/search?q=love'},
-{g:'Dramachi',m:'GET',p:'/dr/home',d:'Drama home',t:'/dr/home'},
-{g:'IPTV',m:'GET',p:'/iptv/channels',d:'Live TV channels',t:'/iptv/channels?limit=30'},
-{g:'HentaiCity',m:'GET',p:'/hc/recent',d:'Recent videos',t:'/hc/recent'},
-{g:'HentaiCity',m:'GET',p:'/hc/popular',d:'Popular',t:'/hc/popular'},
-{g:'HentaiCity',m:'GET',p:'/hc/search',d:'Search',t:'/hc/search?q=anime'},
-{g:'HentaiCity',m:'GET',p:'/hc/watch',d:'HLS CDN stream',t:'/hc/watch?id=weak-teacher-1-clumsy-busty-anime-teacher-rips-her-stockings-in-class-6IvrFW0nkUP'},
-{g:'Aggregate',m:'GET',p:'/search',d:'Multi-provider search',t:'/search?q=batman'},
-{g:'Meta',m:'GET',p:'/health',d:'Health check',t:'/health'},
+{g:'MovieBox',p:'/mb/search',d:'Search all titles',h:'Query <code>q</code>. Returns <code>items[].subjectId</code> for play/detail.',t:'/mb/search?q=avatar'},
+{g:'MovieBox',p:'/mb/movies',d:'Search movies only',h:'subjectType=1 filter. Use any keyword <code>q</code>.',t:'/mb/movies?q=love'},
+{g:'MovieBox',p:'/mb/series',d:'Search series only',h:'subjectType=2 filter.',t:'/mb/series?q=love'},
+{g:'MovieBox',p:'/mb/play/{id}',d:'Stream MP4 + DASH',h:'Replace id with subjectId. Use <code>streams</code> where <code>kind=dash</code> and send <code>Cookie</code> header. Optional <code>?se=1&ep=1</code> for series.',t:'/mb/play/1654274595068805784'},
+{g:'MovieBox',p:'/mb/detail/{id}',d:'Full metadata',h:'subjectId from search.',t:'/mb/detail/1654274595068805784'},
+{g:'MovieBox',p:'/mb/resource/{id}',d:'Extra download links',h:'Alternate resourceLink list.',t:'/mb/resource/1654274595068805784'},
+{g:'MovieBox',p:'/mb/seasons/{id}',d:'Season list',h:'Series only.',t:'/mb/seasons/1654274595068805784'},
+{g:'MovieBox',p:'/mb/home',d:'Home feed',h:'tabId default 1. Or use /mb/tab/{1-4}.',t:'/mb/home'},
+{g:'MovieBox',p:'/mb/tab/{tab_id}',d:'Tab feed 1–4',h:'Try tab_id 1,2,3,4 for different home shelves.',t:'/mb/tab/1'},
+{g:'4KHDHub',p:'/fk/home',d:'Latest catalog',h:'Returns cards with <code>id</code> path for detail/stream.',t:'/fk/home'},
+{g:'4KHDHub',p:'/fk/search',d:'Search 4K catalog',h:'<code>q</code> keyword.',t:'/fk/search?q=avatar'},
+{g:'4KHDHub',p:'/fk/detail',d:'Releases + mirrors',h:'path=/slug-movie-123/. Shows GreenMotors mirrors.',t:'/fk/detail?path=/hacksaw-ridge-movie-7809/'},
+{g:'4KHDHub',p:'/fk/stream',d:'Direct CDN resolve',h:'Same path + resolve=true → R2 / gpdl / googleusercontent URLs in <code>direct_streams</code>.',t:'/fk/stream?path=/hacksaw-ridge-movie-7809/&resolve=true'},
+{g:'4KHDHub',p:'/fk/category/{slug}',d:'Category page',h:'slug: movies, series, netflix, anime…',t:'/fk/category/movies'},
+{g:'Tools',p:'/tools/resolve',d:'HubCloud → CDN',h:'Pass hubcloud.ist/drive/… or greenmotors URL. Returns r2.cloudflarestorage direct links.',t:'/tools/resolve?url=https://hubcloud.ist/drive/1qg90m0nr2599rq'},
+{g:'Tools',p:'/tools/pixeldrain',d:'PixelDrain download',h:'File id only → ?download URL.',t:'/tools/pixeldrain?id=GauktM6T'},
+{g:'Dramachi',p:'/dr/search',d:'Drama search',h:'Returns list with thumb filename. No public stream API upstream.',t:'/dr/search?q=love'},
+{g:'Dramachi',p:'/dr/home',d:'Drama home',h:'Home feed if provided by upstream.',t:'/dr/home'},
+{g:'Dramachi',p:'/dr/detail',d:'Detail probe',h:'Tries multiple interfaces; often null. Use /dr/thumb for posters.',t:'/dr/detail?id=524&content=movies'},
+{g:'Dramachi',p:'/dr/thumb',d:'Poster URL',h:'name = thumb from search (e.g. godlovescaviar2012h.jpg).',t:'/dr/thumb?name=godlovescaviar2012h.jpg'},
+{g:'IPTV',p:'/iptv/channels',d:'Live TV M3U',h:'source=0 global, 1=BD, 2=IN. Optional q filter.',t:'/iptv/channels?limit=30'},
+{g:'HentaiCity',p:'/hc/recent',d:'Recent + CDN map',h:'Each item may include <code>streams</code> (hls + all mp4) from poster folder/id.',t:'/hc/recent'},
+{g:'HentaiCity',p:'/hc/popular',d:'Popular list',h:'Same shape as recent.',t:'/hc/popular'},
+{g:'HentaiCity',p:'/hc/search',d:'Search videos',h:'q=keyword.',t:'/hc/search?q=anime'},
+{g:'HentaiCity',p:'/hc/watch',d:'Watch / scrape',h:'id=slug or folder+vid. Prefer folder&vid if HTML blocked.',t:'/hc/watch?folder=0449&vid=38135'},
+{g:'HentaiCity',p:'/hc/cdn',d:'CDN builder only',h:'No scrape. folder + vid → all quality URLs.',t:'/hc/cdn?folder=0267&vid=38191'},
+{g:'Aggregate',p:'/search',d:'Multi search',h:'MovieBox + 4K + Drama in one call.',t:'/search?q=batman'},
+{g:'Meta',p:'/health',d:'Health',h:'Version and provider list.',t:'/health'},
 ];
-let openIdx=-1;
-function filt(){
-  const q=(document.getElementById('q').value||'').toLowerCase();
-  document.querySelectorAll('.ep').forEach(el=>{
-    el.style.display=!q||(el.dataset.t||'').includes(q)?'':'none';
-  });
-}
+function filt(){const q=(document.getElementById('q').value||'').toLowerCase();
+document.querySelectorAll('.ep').forEach(el=>{el.style.display=!q||(el.dataset.t||'').includes(q)?'':'none'})}
 function render(){
-  document.getElementById('n').textContent=E.length;
-  let html='', last='';
-  E.forEach((e,i)=>{
-    if(e.g!==last){html+=`<div class="sec" id="${e.g}">${e.g}</div>`;last=e.g}
-    html+=`<div class="ep" data-t="${(e.g+' '+e.p+' '+e.d).toLowerCase()}" id="ep${i}">
-      <div class="ep-head" onclick="toggle(${i})"><span class="method">${e.m}</span>
-      <span class="ep-path">${e.p}</span><span class="ep-desc">${e.d}</span></div>
-      <div class="ep-body">
-        <p class="hint">${e.d}</p>
-        <div class="row"><input class="field" id="u${i}" value="${API}${e.t}"/>
-        <button class="btn" onclick="run(${i})">Try it</button>
-        <button class="ghost" onclick="navigator.clipboard.writeText(document.getElementById('u${i}').value)">Copy</button></div>
-        <pre id="o${i}">Ready</pre>
-      </div></div>`;
-  });
-  document.getElementById('list').innerHTML=html;
+ document.getElementById('n').textContent=E.length; let h='',last='';
+ E.forEach((e,i)=>{
+  if(e.g!==last){h+=`<div class="sec" id="${e.g}">${e.g}</div>`;last=e.g}
+  h+=`<div class="ep" style="animation-delay:${(i%8)*0.04}s" data-t="${(e.g+' '+e.p+' '+e.d).toLowerCase()}" id="ep${i}">
+   <div class="ep-head" onclick="tog(${i})"><span class="method">GET</span><span class="path">${e.p}</span><span class="chev">›</span></div>
+   <div class="ep-body"><div class="how"><b>${e.d}</b><br/>${e.h}</div>
+   <div class="row"><input class="field" id="u${i}" value="${API}${e.t}"/>
+   <button class="btn" onclick="run(${i})">Try it</button>
+   <button class="ghost" onclick="navigator.clipboard.writeText(document.getElementById('u${i}').value)">Copy</button></div>
+   <pre id="o${i}">Ready — press Try it</pre></div></div>`;
+ });
+ document.getElementById('list').innerHTML=h;
 }
-function toggle(i){
-  const el=document.getElementById('ep'+i);
-  const was=el.classList.contains('open');
-  document.querySelectorAll('.ep').forEach(e=>e.classList.remove('open'));
-  if(!was) el.classList.add('open');
-}
-async function run(i){
-  const u=document.getElementById('u'+i).value; const out=document.getElementById('o'+i);
-  out.textContent='Loading…'; const t0=performance.now();
-  try{
-    const r=await fetch(u); const t=await r.text();
-    let p=t; try{p=JSON.stringify(JSON.parse(t),null,2)}catch(_){}
-    out.textContent=r.status+' · '+Math.round(performance.now()-t0)+'ms\\n\\n'+p.slice(0,14000);
-  }catch(e){out.textContent=String(e)}
-}
+function tog(i){const el=document.getElementById('ep'+i);const o=el.classList.contains('open');
+ document.querySelectorAll('.ep').forEach(e=>e.classList.remove('open')); if(!o) el.classList.add('open')}
+async function run(i){const u=document.getElementById('u'+i).value;const out=document.getElementById('o'+i);
+ out.textContent='Loading…';const t0=performance.now();
+ try{const r=await fetch(u);const t=await r.text();let p=t;try{p=JSON.stringify(JSON.parse(t),null,2)}catch(_){}
+ out.textContent=r.status+' · '+Math.round(performance.now()-t0)+'ms\\n\\n'+p.slice(0,14000)}catch(e){out.textContent=String(e)}}
 render();
 </script>
-</body>
-</html>
+</body></html>
 """
+
 
 @app.get("/docs", response_class=HTMLResponse, include_in_schema=False)
 async def docs_ui():
