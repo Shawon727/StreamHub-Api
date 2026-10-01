@@ -1,9 +1,9 @@
-# StreamHub API v7.3.0 — fixed MovieBox + 4K CDN chain + modern docs — creator: shawon
+# StreamHub API v7.4.0 — creator: shawon
 from __future__ import annotations
 
 import asyncio, base64, hashlib, hmac, json, random, re, time, uuid
 from typing import Any, Dict, List, Optional
-from urllib.parse import parse_qsl, urljoin, urlparse, unquote
+from urllib.parse import parse_qsl, urljoin, urlparse, quote
 
 import httpx
 from bs4 import BeautifulSoup
@@ -11,18 +11,23 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
-CREATOR, VERSION = "shawon", "7.3.0"
+CREATOR, VERSION = "shawon", "7.4.0"
 app = FastAPI(title="StreamHub API", version=VERSION, docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+MOBILE_UA = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36"
 
 def ok(data=None, **extra):
     o = {"creator": CREATOR, "ok": True}
-    if data is not None: o["data"] = data
-    o.update(extra); return o
+    if data is not None:
+        o["data"] = data
+    o.update(extra)
+    return o
 
 def fail(msg, **extra):
-    o = {"creator": CREATOR, "ok": False, "error": msg}; o.update(extra); return o
+    o = {"creator": CREATOR, "ok": False, "error": msg}
+    o.update(extra)
+    return o
 
 def _client(timeout=25.0):
     return httpx.AsyncClient(
@@ -34,200 +39,296 @@ def _client(timeout=25.0):
 
 # ========== MOVIEBOX ==========
 MB_HOSTS = [
-    "https://api6.aoneroom.com","https://api5.aoneroom.com","https://api4.aoneroom.com",
-    "https://api4sg.aoneroom.com","https://api3.aoneroom.com","https://api6sg.aoneroom.com",
+    "https://api6.aoneroom.com", "https://api5.aoneroom.com", "https://api4.aoneroom.com",
+    "https://api4sg.aoneroom.com", "https://api3.aoneroom.com", "https://api6sg.aoneroom.com",
     "https://api.inmoviebox.com",
 ]
 MB_SECRET = bytes([0xEF,0xA8,0x91,0x97,0x4E,0xEC,0xD3,0x14,0x8D,0xF6,0x3A,0xA6,0x11,0x60,0x2D,0xEF,0xD1,0x01,0x25,0x9B,0xA5,0x21,0x02,0x2C,0x57,0xAE,0x05,0x66,0xBD,0x8E])
-_mb_token=None; _mb_token_exp=0.0; _mb_host_idx=0
-_mb_device_id="".join(random.choice("0123456789abcdef") for _ in range(32))
-_mb_gaid=str(uuid.uuid4())
+_mb_token = None
+_mb_token_exp = 0.0
+_mb_host_idx = 0
+_mb_device_id = "".join(random.choice("0123456789abcdef") for _ in range(32))
+_mb_gaid = str(uuid.uuid4())
 
-def _md5_hex(b: bytes) -> str: return hashlib.md5(b).hexdigest()
+def _md5_hex(b: bytes) -> str:
+    return hashlib.md5(b).hexdigest()
 
 def _mb_client_info():
-    vc=50020119
-    ci=json.dumps({"package_name":"com.community.oneroom","version_name":"4.0.01.0813.03","version_code":vc,"os":"android","os_version":"13","install_ch":"ps","device_id":_mb_device_id,"install_store":"ps","gaid":_mb_gaid,"brand":"Redmi","model":"23078RKD5C","system_language":"en","net":"NETWORK_WIFI","region":"US","timezone":"Asia/Kolkata","sp_code":"40401","X-Play-Mode":"2"},separators=(",",":"))
-    ua=f"com.community.oneroom/{vc} (Linux; U; Android 13; en_US; 23078RKD5C; Build/TQ2A.230405.003; Cronet/135.0.7012.3)"
+    vc = 50020119
+    ci = json.dumps({
+        "package_name": "com.community.oneroom", "version_name": "4.0.01.0813.03", "version_code": vc,
+        "os": "android", "os_version": "13", "install_ch": "ps", "device_id": _mb_device_id,
+        "install_store": "ps", "gaid": _mb_gaid, "brand": "Redmi", "model": "23078RKD5C",
+        "system_language": "en", "net": "NETWORK_WIFI", "region": "US", "timezone": "Asia/Kolkata",
+        "sp_code": "40401", "X-Play-Mode": "2",
+    }, separators=(",", ":"))
+    ua = f"com.community.oneroom/{vc} (Linux; U; Android 13; en_US; 23078RKD5C; Build/TQ2A.230405.003; Cronet/135.0.7012.3)"
     return ua, ci
 
 def _mb_sign(method, url, body=None):
-    ts=int(time.time()*1000)
-    p=urlparse(url); params=sorted(parse_qsl(p.query, keep_blank_values=True))
-    qs="&".join(f"{k}={v}" for k,v in params); canon=p.path+(f"?{qs}" if qs else "")
-    body_b=(body or "").encode(); bh=_md5_hex(body_b) if body_b else ""; bl=str(len(body_b)) if body_b else ""
-    accept=ctype="application/json"
-    canonical=f"{method.upper()}\n{accept}\n{ctype}\n{bl}\n{ts}\n{bh}\n{canon}"
-    sig=base64.b64encode(hmac.new(MB_SECRET, canonical.encode(), hashlib.md5).digest()).decode()
-    rev=str(ts)[::-1]; ua,ci=_mb_client_info()
-    return {"Accept":accept,"Content-Type":ctype,"Connection":"keep-alive","User-Agent":ua,
-        "x-client-token":f"{ts},{_md5_hex(rev.encode())}","x-tr-signature":f"{ts}|2|{sig}",
-        "x-client-info":ci,"x-client-status":"0",
-        "x-forwarded-for":f"103.241.{random.randint(1,254)}.{random.randint(1,254)}"}
+    ts = int(time.time() * 1000)
+    p = urlparse(url)
+    params = sorted(parse_qsl(p.query, keep_blank_values=True))
+    qs = "&".join(f"{k}={v}" for k, v in params)
+    canon = p.path + (f"?{qs}" if qs else "")
+    body_b = (body or "").encode()
+    bh = _md5_hex(body_b) if body_b else ""
+    bl = str(len(body_b)) if body_b else ""
+    accept = ctype = "application/json"
+    canonical = f"{method.upper()}\n{accept}\n{ctype}\n{bl}\n{ts}\n{bh}\n{canon}"
+    sig = base64.b64encode(hmac.new(MB_SECRET, canonical.encode(), hashlib.md5).digest()).decode()
+    rev = str(ts)[::-1]
+    ua, ci = _mb_client_info()
+    return {
+        "Accept": accept, "Content-Type": ctype, "Connection": "keep-alive", "User-Agent": ua,
+        "x-client-token": f"{ts},{_md5_hex(rev.encode())}", "x-tr-signature": f"{ts}|2|{sig}",
+        "x-client-info": ci, "x-client-status": "0",
+        "x-forwarded-for": f"103.241.{random.randint(1,254)}.{random.randint(1,254)}",
+    }
 
 def _mb_unwrap(payload):
-    if isinstance(payload.get("data"), dict): return payload["data"]
-    return payload
+    if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+        return payload["data"]
+    return payload if isinstance(payload, dict) else {}
 
 async def _mb_request(method, path, body=None, token=None):
     global _mb_host_idx
-    last="hosts exhausted"
+    last = "hosts exhausted"
     async with _client(18) as client:
         for i in range(len(MB_HOSTS)):
-            base=MB_HOSTS[(_mb_host_idx+i)%len(MB_HOSTS)]; url=base+path
-            headers=_mb_sign(method,url,body)
-            if token: headers["Authorization"]=f"Bearer {token}"
+            base = MB_HOSTS[(_mb_host_idx + i) % len(MB_HOSTS)]
+            url = base + path
+            headers = _mb_sign(method, url, body)
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
             try:
-                r=await (client.get(url,headers=headers) if method.upper()=="GET" else client.post(url,content=body or "",headers=headers))
-                if r.status_code in (403,406,429,500,502,503,504):
-                    last=f"{base}->{r.status_code}"; continue
-                if r.status_code>=400:
-                    last=f"{base}->{r.status_code}:{r.text[:120]}"; continue
-                _mb_host_idx=(_mb_host_idx+i)%len(MB_HOSTS)
-                try: return r.json()
-                except Exception: return {"raw":r.text[:2000]}
+                if method.upper() == "GET":
+                    r = await client.get(url, headers=headers)
+                else:
+                    r = await client.post(url, content=body or "", headers=headers)
+                if r.status_code in (403, 406, 429, 500, 502, 503, 504):
+                    last = f"{base}->{r.status_code}"
+                    continue
+                if r.status_code >= 400:
+                    last = f"{base}->{r.status_code}:{r.text[:120]}"
+                    continue
+                _mb_host_idx = (_mb_host_idx + i) % len(MB_HOSTS)
+                try:
+                    return r.json()
+                except Exception:
+                    return {"raw": r.text[:2000]}
             except Exception as e:
-                last=str(e); continue
+                last = str(e)
+                continue
     raise HTTPException(502, detail=fail("MovieBox upstream failed", detail=last))
 
 async def _mb_session():
     global _mb_token, _mb_token_exp
-    if _mb_token and time.time()<_mb_token_exp: return _mb_token
-    data=await _mb_request("POST","/wefeed-mobile-bff/user-api/visitor-login","{}")
-    token=_mb_unwrap(data).get("token") or data.get("token")
-    if not token: raise HTTPException(502, detail=fail("MovieBox login failed", raw=data))
-    _mb_token=str(token); _mb_token_exp=time.time()+3500; return _mb_token
+    if _mb_token and time.time() < _mb_token_exp:
+        return _mb_token
+    data = await _mb_request("POST", "/wefeed-mobile-bff/user-api/visitor-login", "{}")
+    token = _mb_unwrap(data).get("token") or data.get("token")
+    if not token:
+        raise HTTPException(502, detail=fail("MovieBox login failed", raw=data))
+    _mb_token = str(token)
+    _mb_token_exp = time.time() + 3500
+    return _mb_token
 
 def _dash_from_cookie(sign_cookie):
-    if not sign_cookie: return None
-    m=re.search(r"urlprefix=([A-Za-z0-9+/=]+)", sign_cookie)
-    if not m: return None
-    raw=m.group(1); pad=raw+"="*((4-len(raw)%4)%4)
-    try: base=base64.b64decode(pad).decode("utf-8","ignore")
-    except Exception: return None
-    if not base.startswith("http"): return None
-    cookie=sign_cookie if sign_cookie.startswith("Edge-Cache-Cookie=") else f"Edge-Cache-Cookie={sign_cookie}"
-    return {"url":base.rstrip("/")+"/index.mpd","format":"DASH","kind":"dash","cookie":cookie,"base":base,
-            "note":"Send Cookie header when playing"}
+    if not sign_cookie:
+        return None
+    m = re.search(r"urlprefix=([A-Za-z0-9+/=]+)", sign_cookie)
+    if not m:
+        return None
+    raw = m.group(1)
+    pad = raw + "=" * ((4 - len(raw) % 4) % 4)
+    try:
+        base = base64.b64decode(pad).decode("utf-8", "ignore")
+    except Exception:
+        return None
+    if not base.startswith("http"):
+        return None
+    cookie = sign_cookie if sign_cookie.startswith("Edge-Cache-Cookie=") else f"Edge-Cache-Cookie={sign_cookie}"
+    return {
+        "url": base.rstrip("/") + "/index.mpd", "format": "DASH", "kind": "dash",
+        "cookie": cookie, "base": base, "note": "Send Cookie header when playing",
+    }
 
 def _mb_streams(payload):
-    streams=[]; data=_mb_unwrap(payload)
+    streams = []
+    data = _mb_unwrap(payload)
     for s in (data.get("streams") or data.get("list") or []):
-        if not isinstance(s, dict): continue
-        url=s.get("url") or s.get("playUrl") or s.get("streamUrl")
-        cookie=s.get("signCookie") or s.get("cookie") or ""
+        if not isinstance(s, dict):
+            continue
+        url = s.get("url") or s.get("playUrl") or s.get("streamUrl")
+        cookie = s.get("signCookie") or s.get("cookie") or ""
         if url:
-            streams.append({"id":s.get("id"),"url":url,"quality":s.get("resolutions") or s.get("quality"),
-                "codec":s.get("codecName") or s.get("codec"),"format":s.get("format") or "MP4",
-                "size":s.get("size"),"duration":s.get("duration"),"cookie":cookie or None,"kind":"mp4"})
-        dash=_dash_from_cookie(cookie)
+            streams.append({
+                "id": s.get("id"), "url": url, "quality": s.get("resolutions") or s.get("quality"),
+                "codec": s.get("codecName") or s.get("codec"), "format": s.get("format") or "MP4",
+                "size": s.get("size"), "duration": s.get("duration"), "cookie": cookie or None, "kind": "mp4",
+            })
+        dash = _dash_from_cookie(cookie)
         if dash:
-            dash["id"]=s.get("id"); dash["quality"]=s.get("resolutions"); dash["codec"]=s.get("codecName") or "h265"
+            dash["id"] = s.get("id")
+            dash["quality"] = s.get("resolutions")
+            dash["codec"] = s.get("codecName") or "h265"
             streams.append(dash)
     return streams
 
+def _mb_items_from_search(inner):
+    items = []
+    for block in inner.get("results") or []:
+        for s in block.get("subjects") or []:
+            cover = s.get("cover")
+            items.append({
+                "subjectId": s.get("subjectId") or s.get("id"),
+                "title": s.get("title"),
+                "type": s.get("subjectType"),
+                "year": (s.get("releaseDate") or "")[:4],
+                "genre": s.get("genre"),
+                "cover": cover.get("url") if isinstance(cover, dict) else cover,
+                "imdb": s.get("imdbRating") or s.get("rating"),
+            })
+    return items
+
 @app.get("/mb/home", tags=["MovieBox"])
 async def mb_home(page: int = 1, tab_id: str = "1"):
-    tok=await _mb_session()
-    data=await _mb_request("GET", f"/wefeed-mobile-bff/tab-operating?page={page}&tabId={tab_id}&version=", token=tok)
+    tok = await _mb_session()
+    data = await _mb_request("GET", f"/wefeed-mobile-bff/tab-operating?page={page}&tabId={tab_id}&version=", token=tok)
     return ok(_mb_unwrap(data), provider="moviebox", level="primary", endpoint="home")
 
 @app.get("/mb/search", tags=["MovieBox"])
 async def mb_search(q: str = Query(..., min_length=1), page: int = 1):
-    tok=await _mb_session()
-    body=json.dumps({"keyword":q,"page":page,"perPage":20})
-    data=await _mb_request("POST","/wefeed-mobile-bff/subject-api/search/v2", body, token=tok)
-    inner=_mb_unwrap(data); items=[]
-    for block in inner.get("results") or []:
-        for s in block.get("subjects") or []:
-            cover=s.get("cover")
-            items.append({"subjectId":s.get("subjectId") or s.get("id"),"title":s.get("title"),
-                "type":s.get("subjectType"),"year":(s.get("releaseDate") or "")[:4],"genre":s.get("genre"),
-                "cover":cover.get("url") if isinstance(cover,dict) else cover,"imdb":s.get("imdbRating") or s.get("rating")})
-    return ok({"items":items,"count":len(items),"pager":inner.get("pager")}, provider="moviebox", level="primary", endpoint="search", query=q)
+    tok = await _mb_session()
+    body = json.dumps({"keyword": q, "page": page, "perPage": 20})
+    data = await _mb_request("POST", "/wefeed-mobile-bff/subject-api/search/v2", body, token=tok)
+    inner = _mb_unwrap(data)
+    items = _mb_items_from_search(inner)
+    return ok({"items": items, "count": len(items), "pager": inner.get("pager")}, provider="moviebox", level="primary", endpoint="search", query=q)
+
+@app.get("/mb/movies", tags=["MovieBox"])
+async def mb_movies(q: str = Query("a", min_length=1), page: int = 1):
+    tok = await _mb_session()
+    body = json.dumps({"keyword": q, "page": page, "perPage": 20, "subjectType": 1})
+    data = await _mb_request("POST", "/wefeed-mobile-bff/subject-api/search/v2", body, token=tok)
+    items = _mb_items_from_search(_mb_unwrap(data))
+    return ok({"items": items, "count": len(items)}, provider="moviebox", level="primary", endpoint="movies", query=q)
+
+@app.get("/mb/series", tags=["MovieBox"])
+async def mb_series(q: str = Query("a", min_length=1), page: int = 1):
+    tok = await _mb_session()
+    body = json.dumps({"keyword": q, "page": page, "perPage": 20, "subjectType": 2})
+    data = await _mb_request("POST", "/wefeed-mobile-bff/subject-api/search/v2", body, token=tok)
+    items = _mb_items_from_search(_mb_unwrap(data))
+    return ok({"items": items, "count": len(items)}, provider="moviebox", level="primary", endpoint="series", query=q)
+
+@app.get("/mb/tab/{tab_id}", tags=["MovieBox"])
+async def mb_tab(tab_id: str, page: int = 1):
+    tok = await _mb_session()
+    data = await _mb_request("GET", f"/wefeed-mobile-bff/tab-operating?page={page}&tabId={tab_id}&version=", token=tok)
+    return ok(_mb_unwrap(data), provider="moviebox", level="primary", endpoint="tab", tab_id=tab_id)
 
 @app.get("/mb/detail/{subject_id}", tags=["MovieBox"])
 async def mb_detail(subject_id: str):
-    tok=await _mb_session()
-    data=await _mb_request("GET", f"/wefeed-mobile-bff/subject-api/get?subjectId={subject_id}", token=tok)
+    tok = await _mb_session()
+    data = await _mb_request("GET", f"/wefeed-mobile-bff/subject-api/get?subjectId={subject_id}", token=tok)
     return ok(_mb_unwrap(data), provider="moviebox", level="primary", endpoint="detail")
 
 @app.get("/mb/seasons/{subject_id}", tags=["MovieBox"])
 async def mb_seasons(subject_id: str):
-    tok=await _mb_session()
-    data=await _mb_request("GET", f"/wefeed-mobile-bff/subject-api/season-info?subjectId={subject_id}", token=tok)
+    tok = await _mb_session()
+    data = await _mb_request("GET", f"/wefeed-mobile-bff/subject-api/season-info?subjectId={subject_id}", token=tok)
     return ok(_mb_unwrap(data), provider="moviebox", level="primary", endpoint="seasons")
 
 @app.get("/mb/play/{subject_id}", tags=["MovieBox"])
 async def mb_play(subject_id: str, se: Optional[int] = None, ep: Optional[int] = None):
-    tok=await _mb_session()
+    tok = await _mb_session()
     if se is not None and ep is not None:
-        path=f"/wefeed-mobile-bff/subject-api/play-info/v2?subjectId={subject_id}&se={se}&ep={ep}"
+        path = f"/wefeed-mobile-bff/subject-api/play-info/v2?subjectId={subject_id}&se={se}&ep={ep}"
     else:
-        path=f"/wefeed-mobile-bff/subject-api/play-info/v2?subjectId={subject_id}"
-    data=await _mb_request("GET", path, token=tok)
-    inner=_mb_unwrap(data); streams=_mb_streams(data)
-    return ok({"subject_id":subject_id,"season":se,"episode":ep,"title":inner.get("title"),
-        "streams":streams,"count":len(streams),"displayResolutions":inner.get("displayResolutions")},
-        provider="moviebox", level="primary", endpoint="play",
-        note="kind=dash needs Cookie header; kind=mp4 is direct URL")
+        path = f"/wefeed-mobile-bff/subject-api/play-info/v2?subjectId={subject_id}"
+    data = await _mb_request("GET", path, token=tok)
+    inner = _mb_unwrap(data)
+    streams = _mb_streams(data)
+    return ok({
+        "subject_id": subject_id, "season": se, "episode": ep, "title": inner.get("title"),
+        "streams": streams, "count": len(streams), "displayResolutions": inner.get("displayResolutions"),
+    }, provider="moviebox", level="primary", endpoint="play",
+       note="kind=dash needs Cookie header; kind=mp4 is direct URL")
 
 @app.get("/mb/resource/{subject_id}", tags=["MovieBox"])
 async def mb_resource(subject_id: str, se: Optional[int] = None, ep: Optional[int] = None, page: int = 1, per_page: int = 20):
-    tok=await _mb_session()
+    tok = await _mb_session()
     if se is not None and ep is not None:
-        path=f"/wefeed-mobile-bff/subject-api/resource?subjectId={subject_id}&se={se}&ep={ep}&page={page}&perPage={per_page}"
+        path = f"/wefeed-mobile-bff/subject-api/resource?subjectId={subject_id}&se={se}&ep={ep}&page={page}&perPage={per_page}"
     else:
-        path=f"/wefeed-mobile-bff/subject-api/resource?subjectId={subject_id}&page={page}&perPage={per_page}"
-    data=await _mb_request("GET", path, token=tok)
-    inner=_mb_unwrap(data); links=[]
+        path = f"/wefeed-mobile-bff/subject-api/resource?subjectId={subject_id}&page={page}&perPage={per_page}"
+    data = await _mb_request("GET", path, token=tok)
+    inner = _mb_unwrap(data)
+    links = []
     for item in inner.get("list") or []:
-        link=item.get("resourceLink") or item.get("url")
-        if link: links.append({"title":item.get("title"),"url":link,"size":item.get("size"),
-            "episode":item.get("episode"),"resourceId":item.get("resourceId")})
-    return ok({"links":links,"count":len(links),"pager":inner.get("pager")}, provider="moviebox", level="primary", endpoint="resource")
+        link = item.get("resourceLink") or item.get("url")
+        if link:
+            links.append({"title": item.get("title"), "url": link, "size": item.get("size"),
+                          "episode": item.get("episode"), "resourceId": item.get("resourceId")})
+    return ok({"links": links, "count": len(links), "pager": inner.get("pager")}, provider="moviebox", level="primary", endpoint="resource")
 
-# ========== 4KHDHub + HubCloud CDN (GreenMotors s('o') payload) ==========
+# ========== 4KHDHub + HubCloud ==========
 FK_BASE = "https://4khdhub.one"
 
 def _fk_cards(html):
-    soup = BeautifulSoup(html, "html.parser"); items = []
+    soup = BeautifulSoup(html, "html.parser")
+    items = []
     for a in soup.select("a.movie-card"):
         href = a.get("href") or ""
         title_el = a.select_one(".movie-card-title")
         title = (title_el.get_text(strip=True) if title_el else a.get_text(strip=True)) or ""
-        if not title or not href: continue
+        if not title or not href:
+            continue
         full = urljoin(FK_BASE, href)
-        img = a.select_one("img"); poster = img.get("src") if img else None
-        meta_el = a.select_one(".movie-card-meta"); meta = meta_el.get_text(" ", strip=True) if meta_el else ""
+        img = a.select_one("img")
+        poster = img.get("src") if img else None
+        meta_el = a.select_one(".movie-card-meta")
+        meta = meta_el.get_text(" ", strip=True) if meta_el else ""
         year_m = re.search(r"(19|20)\d{2}", meta)
-        items.append({"id": urlparse(full).path, "title": title, "url": full, "poster": poster,
+        items.append({
+            "id": urlparse(full).path, "title": title, "url": full, "poster": poster,
             "meta": meta, "year": year_m.group(0) if year_m else None,
-            "type": "series" if "-series-" in href else "movie"})
+            "type": "series" if "-series-" in href else "movie",
+        })
     return items
 
 def _fk_downloads(html):
-    soup = BeautifulSoup(html, "html.parser"); releases = []
+    soup = BeautifulSoup(html, "html.parser")
+    releases = []
     for item in soup.select(".download-item"):
         title_el = item.select_one(".file-title")
         title = title_el.get_text(" ", strip=True) if title_el else ""
         mirrors = []
         for a in item.select("a[href]"):
-            href = a.get("href") or ""; label = " ".join(a.get_text().split()) or "mirror"
-            if href.startswith("http"): mirrors.append({"label": label, "url": href})
+            href = a.get("href") or ""
+            label = " ".join(a.get_text().split()) or "mirror"
+            if href.startswith("http"):
+                mirrors.append({"label": label, "url": href})
         if title or mirrors:
             quality = None
             for q in ("2160p", "1080p", "720p", "480p", "4K", "UHD"):
-                if q.lower() in title.lower(): quality = q; break
+                if q.lower() in title.lower():
+                    quality = q
+                    break
             releases.append({"title": title, "quality": quality, "mirrors": mirrors})
     return releases
 
 def _rot13(s):
     out = []
     for c in s:
-        if "a" <= c <= "m" or "A" <= c <= "M": out.append(chr(ord(c) + 13))
-        elif "n" <= c <= "z" or "N" <= c <= "Z": out.append(chr(ord(c) - 13))
-        else: out.append(c)
+        if "a" <= c <= "m" or "A" <= c <= "M":
+            out.append(chr(ord(c) + 13))
+        elif "n" <= c <= "z" or "N" <= c <= "Z":
+            out.append(chr(ord(c) - 13))
+        else:
+            out.append(c)
     return "".join(out)
 
 def _decode_gm_payload(payload):
@@ -244,17 +345,20 @@ def _decode_gm_payload(payload):
 def _pixeldrain_api(url):
     try:
         p = urlparse(url)
-        if "pixeldrain." not in (p.hostname or ""): return None
+        if "pixeldrain." not in (p.hostname or ""):
+            return None
         path = p.path
-        if path.startswith("/u/"): fid = path[3:].strip("/")
-        elif path.startswith("/api/file/"): fid = path[len("/api/file/"):].strip("/").split("?")[0]
-        else: return None
+        if path.startswith("/u/"):
+            fid = path[3:].strip("/")
+        elif path.startswith("/api/file/"):
+            fid = path[len("/api/file/"):].strip("/").split("?")[0]
+        else:
+            return None
         return f"https://{p.hostname}/api/file/{fid}?download" if fid else None
     except Exception:
         return None
 
 def _extract_cdn_urls(html):
-    """Pull direct CDN links from HubCloud resolver HTML."""
     found = []
     patterns = [
         r'https://[a-f0-9]+\.r2\.cloudflarestorage\.com/[^"\'\s<>]+',
@@ -275,15 +379,8 @@ async def _resolve_hubcloud(drive_url):
     async with _client(35) as client:
         r = await client.get(drive_url, headers={"Referer": "https://4khdhub.one/"})
         html = r.text
-        # gamerxyt resolver button
         m = re.search(r'https://gamerxyt\.com/hubcloud\.php[^"\']+', html)
         resolver = m.group(0) if m else None
-        if not resolver:
-            soup = BeautifulSoup(html, "html.parser")
-            for a in soup.select("a[href*='gamerxyt'], a[href*='hubcloud.php'], a#download, a.btn"):
-                href = a.get("href") or ""
-                if href.startswith("https://") and ("gamerxyt" in href or "download" in href.lower()):
-                    resolver = href; break
         page = html
         if resolver:
             try:
@@ -292,30 +389,27 @@ async def _resolve_hubcloud(drive_url):
             except Exception:
                 pass
         for u in _extract_cdn_urls(page):
-            api = _pixeldrain_api(u) or u
-            kind = "direct"
-            if "r2.cloudflarestorage" in api or "googleusercontent" in api or "gpdl.hubcloud" in api:
-                kind = "direct"
-            elif "pixeldrain" in api:
-                kind = "direct"
-            results.append({"label": "CDN", "url": api, "kind": kind})
-        # pixeldrain in scripts
+            results.append({"label": "CDN", "url": _pixeldrain_api(u) or u, "kind": "direct"})
         for prefix in ("https://pixeldrain.dev/u/", "https://pixeldrain.com/u/", "https://pixeldrain.dev/api/file/", "https://pixeldrain.com/api/file/"):
             idx = 0
             while True:
                 pos = page.find(prefix, idx)
-                if pos < 0: break
+                if pos < 0:
+                    break
                 end = pos
-                while end < len(page) and page[end] not in "\"' \t\n\r<>\\": end += 1
+                while end < len(page) and page[end] not in "\"' \t\n\r<>\\":
+                    end += 1
                 api = _pixeldrain_api(page[pos:end])
                 if api and not any(x["url"] == api for x in results):
                     results.append({"label": "PixelDrain", "url": api, "kind": "direct"})
                 idx = end
-    # dedupe
-    seen = set(); out = []
+    seen = set()
+    out = []
     for x in results:
-        if x["url"] in seen: continue
-        seen.add(x["url"]); out.append(x)
+        if x["url"] in seen:
+            continue
+        seen.add(x["url"])
+        out.append(x)
     return out
 
 async def _resolve_hubdrive(drive_url):
@@ -328,82 +422,23 @@ async def _resolve_hubdrive(drive_url):
     return [{"label": "HubDrive", "url": drive_url, "kind": "intermediate"}]
 
 async def _resolve_greenmotors(gm_url):
-    """New GreenMotors flow: page embeds s('o','PAYLOAD') then redirects."""
     async with _client(30) as client:
         r = await client.get(gm_url, headers={"Referer": "https://4khdhub.one/", "Accept": "text/html", "User-Agent": UA})
         html = r.text
-        # Extract localStorage payload: s('o','....', timeout)
         m = re.search(r"s\(\s*['\"]o['\"]\s*,\s*['\"]([^'\"]+)['\"]", html)
-        target = None
-        if m:
-            target = _decode_gm_payload(m.group(1))
+        target = _decode_gm_payload(m.group(1)) if m else None
         if not target:
             for mm in re.findall(r"https?://[^\s\"']+hubcloud[^\s\"']+", html):
-                target = mm; break
+                target = mm
+                break
         if not target:
-            if "Failed to decode" in html or len(html) < 80:
-                return [{"label": "GreenMotors", "url": gm_url, "kind": "intermediate",
-                         "note": "Could not decode gateway on this IP"}]
-            return [{"label": "GreenMotors", "url": gm_url, "kind": "intermediate"}]
+            return [{"label": "GreenMotors", "url": gm_url, "kind": "intermediate",
+                     "note": "Could not decode gateway on this IP"}]
         if "hubcloud." in target:
             return await _resolve_hubcloud(target)
         if "hubdrive." in target:
             return await _resolve_hubdrive(target)
         return [{"label": "Direct", "url": _pixeldrain_api(target) or target, "kind": "direct"}]
-
-
-@app.get("/mb/movies", tags=["MovieBox"])
-async def mb_movies(q: str = Query("a", min_length=1), page: int = 1):
-    """Search limited to movies (subjectType=1)."""
-    tok = await _mb_session()
-    body = json.dumps({"keyword": q, "page": page, "perPage": 20, "subjectType": 1})
-    data = await _mb_request("POST", "/wefeed-mobile-bff/subject-api/search/v2", body, token=tok)
-    inner = _mb_unwrap(data)
-    items = []
-    for block in inner.get("results") or []:
-        for s in block.get("subjects") or []:
-            if s.get("subjectType") not in (1, None, "1"):
-                # still include if API ignores filter
-                pass
-            cover = s.get("cover")
-            items.append({
-                "subjectId": s.get("subjectId") or s.get("id"),
-                "title": s.get("title"),
-                "type": s.get("subjectType"),
-                "year": (s.get("releaseDate") or "")[:4],
-                "genre": s.get("genre"),
-                "cover": cover.get("url") if isinstance(cover, dict) else cover,
-            })
-    return ok({"items": items, "count": len(items)}, provider="moviebox", level="primary", endpoint="movies", query=q)
-
-@app.get("/mb/series", tags=["MovieBox"])
-async def mb_series(q: str = Query("a", min_length=1), page: int = 1):
-    """Search limited to series (subjectType=2)."""
-    tok = await _mb_session()
-    body = json.dumps({"keyword": q, "page": page, "perPage": 20, "subjectType": 2})
-    data = await _mb_request("POST", "/wefeed-mobile-bff/subject-api/search/v2", body, token=tok)
-    inner = _mb_unwrap(data)
-    items = []
-    for block in inner.get("results") or []:
-        for s in block.get("subjects") or []:
-            cover = s.get("cover")
-            items.append({
-                "subjectId": s.get("subjectId") or s.get("id"),
-                "title": s.get("title"),
-                "type": s.get("subjectType"),
-                "year": (s.get("releaseDate") or "")[:4],
-                "genre": s.get("genre"),
-                "cover": cover.get("url") if isinstance(cover, dict) else cover,
-            })
-    return ok({"items": items, "count": len(items)}, provider="moviebox", level="primary", endpoint="series", query=q)
-
-@app.get("/mb/tab/{tab_id}", tags=["MovieBox"])
-async def mb_tab(tab_id: str, page: int = 1):
-    """Homepage tabs: 1=home, 2=movies-ish, 3=series-ish, 4=charts (try 1-4)."""
-    tok = await _mb_session()
-    path = f"/wefeed-mobile-bff/tab-operating?page={page}&tabId={tab_id}&version="
-    data = await _mb_request("GET", path, token=tok)
-    return ok(_mb_unwrap(data), provider="moviebox", level="primary", endpoint="tab", tab_id=tab_id)
 
 @app.get("/fk/home", tags=["4KHDHub"])
 async def fk_home():
@@ -431,29 +466,34 @@ async def fk_category(slug: str, page: int = 1):
 async def fk_detail(path: str = Query(...)):
     url = path if path.startswith("http") else urljoin(FK_BASE, path)
     async with _client() as client:
-        r = await client.get(url); html = r.text
+        r = await client.get(url)
+        html = r.text
     soup = BeautifulSoup(html, "html.parser")
-    h1 = soup.select_one("h1"); title = h1.get_text(strip=True) if h1 else None
+    h1 = soup.select_one("h1")
+    title = h1.get_text(strip=True) if h1 else None
     releases = _fk_downloads(html)
     return ok({"title": title, "url": url, "releases": releases, "release_count": len(releases)},
-        provider="4khdhub", level="live", endpoint="detail")
+              provider="4khdhub", level="live", endpoint="detail")
 
 @app.get("/fk/stream", tags=["4KHDHub"])
 async def fk_stream(path: str = Query(...), resolve: bool = Query(True)):
     url = path if path.startswith("http") else urljoin(FK_BASE, path)
     async with _client() as client:
-        r = await client.get(url); html = r.text
+        r = await client.get(url)
+        html = r.text
     soup = BeautifulSoup(html, "html.parser")
-    h1 = soup.select_one("h1"); title = h1.get_text(strip=True) if h1 else None
+    h1 = soup.select_one("h1")
+    title = h1.get_text(strip=True) if h1 else None
     releases = _fk_downloads(html)
     direct = []
     if resolve:
         tasks = []
         for rel in releases[:6]:
             for m in rel.get("mirrors") or []:
+                if len(tasks) >= 8:
+                    break
                 mu = m.get("url") or ""
                 lab = m.get("label")
-                if len(tasks) >= 8: break
                 if "greenmotors." in mu or "greenmountmotors." in mu:
                     tasks.append((_resolve_greenmotors(mu), rel.get("title"), lab))
                 elif "hubcloud." in mu:
@@ -466,22 +506,27 @@ async def fk_stream(path: str = Query(...), resolve: bool = Query(True)):
         for coro, rtitle, label in tasks:
             try:
                 for item in await coro:
-                    direct.append({"release": rtitle, "label": item.get("label") or label,
-                        "url": item.get("url"), "kind": item.get("kind"), "note": item.get("note")})
+                    direct.append({
+                        "release": rtitle, "label": item.get("label") or label,
+                        "url": item.get("url"), "kind": item.get("kind"), "note": item.get("note"),
+                    })
             except Exception as e:
                 direct.append({"release": rtitle, "label": label, "url": None, "kind": "error", "note": str(e)})
-    seen = set(); uniq = []
+    seen = set()
+    uniq = []
     for d in direct:
         u = d.get("url")
-        if not u or u in seen: continue
-        seen.add(u); uniq.append(d)
-    return ok({"title": title, "url": url, "releases": releases,
-        "direct_streams": uniq, "direct_count": len(uniq)},
-        provider="4khdhub", level="live", endpoint="stream")
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        uniq.append(d)
+    return ok({"title": title, "url": url, "releases": releases, "direct_streams": uniq, "direct_count": len(uniq)},
+              provider="4khdhub", level="live", endpoint="stream")
 
 @app.get("/tools/resolve", tags=["Tools"])
 async def tools_resolve(url: str = Query(...)):
-    u = url.strip(); low = u.lower()
+    u = url.strip()
+    low = u.lower()
     try:
         if "greenmotors." in low or "greenmountmotors." in low:
             links = await _resolve_greenmotors(u)
@@ -499,59 +544,110 @@ async def tools_resolve(url: str = Query(...)):
 
 @app.get("/tools/pixeldrain", tags=["Tools"])
 async def tools_pixeldrain(id: str = Query(...)):
-    return ok({"id": id, "download_url": f"https://pixeldrain.com/api/file/{id}?download",
+    return ok({
+        "id": id,
+        "download_url": f"https://pixeldrain.com/api/file/{id}?download",
         "info_url": f"https://pixeldrain.com/api/file/{id}",
-        "alt": f"https://pixeldrain.dev/api/file/{id}?download"},
-        provider="tools", level="tool", endpoint="pixeldrain")
+        "alt": f"https://pixeldrain.dev/api/file/{id}?download",
+    }, provider="tools", level="tool", endpoint="pixeldrain")
 
-# ========== Dramachi / IPTV / HentaiCity / Aggregate ==========
+# ========== Dramachi (search works; home uses search catalog) ==========
 DR_BASE = "https://api.nodeobjects.com"
 
-@app.get("/dr/search", tags=["Dramachi"])
-async def dr_search(q: str = Query(...), page: int = 1):
+def _dr_normalize(raw):
+    """Always return {items:[], page meta}."""
+    if raw is None:
+        return {"items": [], "count": 0}
+    if isinstance(raw, list):
+        items = raw
+    elif isinstance(raw, dict):
+        items = raw.get("data") or raw.get("results") or raw.get("items") or []
+        if not isinstance(items, list):
+            items = []
+    else:
+        items = []
+    out = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        thumb = it.get("thumb") or ""
+        out.append({
+            "id": str(it.get("id") or ""),
+            "title": it.get("title") or it.get("common_title"),
+            "year": it.get("year"),
+            "views": it.get("views"),
+            "content": it.get("content") or "movies",
+            "thumb": thumb,
+            "poster": f"https://static.nodeobjects.com/thumbnail/{thumb}" if thumb else None,
+            "common_title": it.get("common_title"),
+            "category": it.get("category"),
+            "date": it.get("date"),
+        })
+    meta = {}
+    if isinstance(raw, dict):
+        for k in ("last_page", "next_page", "prev_page", "prev_lastpage", "adjuction"):
+            if k in raw:
+                meta[k] = raw[k]
+    return {"items": out, "count": len(out), **meta}
+
+async def _dr_search_raw(q: str, page: int = 1, filter_: str = "all"):
     async with _client() as client:
-        r = await client.get(f"{DR_BASE}/", params={"interface": "search", "q": q, "filter": "all", "page": page})
-        try: data = r.json()
-        except Exception: data = {"raw": r.text[:1500]}
-    return ok(data, provider="dramachi", level="live", endpoint="search", query=q)
+        r = await client.get(f"{DR_BASE}/", params={"interface": "search", "q": q or "a", "filter": filter_, "page": page})
+        try:
+            return r.json()
+        except Exception:
+            return None
+
+@app.get("/dr/search", tags=["Dramachi"])
+async def dr_search(q: str = Query("a"), page: int = 1, filter: str = Query("all", description="all|movies|series")):
+    raw = await _dr_search_raw(q, page, filter)
+    data = _dr_normalize(raw)
+    return ok(data, provider="dramachi", level="live", endpoint="search", query=q, filter=filter)
 
 @app.get("/dr/home", tags=["Dramachi"])
-async def dr_home(page: int = 1):
-    async with _client() as client:
-        r = await client.get(f"{DR_BASE}/", params={"interface": "home", "page": page})
-        try: data = r.json()
-        except Exception: data = {"raw": r.text[:1500]}
-    return ok(data, provider="dramachi", level="live", endpoint="home")
+async def dr_home(page: int = 1, filter: str = Query("all")):
+    """Upstream has no home interface — uses search catalog (q empty / letter)."""
+    # Prefer empty query which returns broad catalog
+    raw = await _dr_search_raw("", page, filter)
+    if not raw or not (isinstance(raw, dict) and (raw.get("data") or [])):
+        raw = await _dr_search_raw("the", page, filter)
+    data = _dr_normalize(raw)
+    return ok(data, provider="dramachi", level="live", endpoint="home", page=page,
+              note="Dramachi has no /home upstream; this is a catalog via search.")
 
 @app.get("/dr/detail", tags=["Dramachi"])
 async def dr_detail(id: str = Query(...), content: str = Query("movies")):
-    """Try common detail interfaces (upstream often returns null — no public stream API)."""
-    results = {}
-    async with _client() as client:
-        for iface in ("detail", "info", "get", "movie", "play", "stream", "sources", "watch"):
-            try:
-                r = await client.get(f"{DR_BASE}/", params={"interface": iface, "id": id, "content": content})
-                if r.text and r.text.strip() not in ("null", ""):
-                    try:
-                        results[iface] = r.json()
-                    except Exception:
-                        results[iface] = r.text[:500]
-            except Exception as e:
-                results[iface] = {"error": str(e)}
-    has = {k: v for k, v in results.items() if v and v != "null"}
-    return ok(
-        {"id": id, "content": content, "available": has, "all": results},
-        provider="dramachi",
-        level="live",
-        endpoint="detail",
-        note="Dramachi public API exposes search/list; stream CDN is not published. Use search results thumb via static.nodeobjects.com/thumbnail/{thumb}",
-    )
+    """No public stream API. Returns poster + re-search match if found."""
+    # Try to find item by scanning search pages for this id
+    found = None
+    for q in (id, "a", "the", "love"):
+        raw = await _dr_search_raw(q, 1, "all")
+        data = _dr_normalize(raw)
+        for it in data["items"]:
+            if it["id"] == str(id):
+                found = it
+                break
+        if found:
+            break
+    if found:
+        return ok({
+            "id": id, "content": content, "title": found.get("title"),
+            "poster": found.get("poster"), "year": found.get("year"),
+            "streams": [], "stream_available": False,
+            "item": found,
+        }, provider="dramachi", level="live", endpoint="detail",
+           note="No public CDN/stream from Dramachi API. Metadata + poster only.")
+    return ok({
+        "id": id, "content": content, "poster": None, "streams": [], "stream_available": False,
+    }, provider="dramachi", level="live", endpoint="detail",
+       note="Item not found in catalog sample. No public stream endpoint exists upstream.")
 
 @app.get("/dr/thumb", tags=["Dramachi"])
-async def dr_thumb(name: str = Query(..., description="thumb filename from search, e.g. godlovescaviar2012h.jpg")):
+async def dr_thumb(name: str = Query(..., description="thumb filename from search")):
     url = f"https://static.nodeobjects.com/thumbnail/{name}"
     return ok({"thumb": name, "url": url}, provider="dramachi", level="live", endpoint="thumb")
 
+# ========== IPTV ==========
 IPTV_SOURCES = [
     "https://iptv-org.github.io/iptv/index.m3u",
     "https://iptv-org.github.io/iptv/countries/bd.m3u",
@@ -559,7 +655,8 @@ IPTV_SOURCES = [
 ]
 
 def _parse_m3u(text):
-    channels = []; name = logo = group = None
+    channels = []
+    name = logo = group = None
     for line in text.splitlines():
         line = line.strip()
         if line.startswith("#EXTINF"):
@@ -577,25 +674,32 @@ def _parse_m3u(text):
 async def iptv_channels(source: int = 0, q: Optional[str] = None, limit: int = 500):
     src = IPTV_SOURCES[max(0, min(source, len(IPTV_SOURCES) - 1))]
     async with _client(30) as client:
-        r = await client.get(src); ch = _parse_m3u(r.text)
+        r = await client.get(src)
+        ch = _parse_m3u(r.text)
     if q:
         ql = q.lower()
         ch = [c for c in ch if ql in c["name"].lower() or ql in (c.get("group") or "").lower()]
     return ok(ch[:limit], provider="iptv", level="live", count=min(len(ch), limit), total=len(ch), source=src, endpoint="channels")
 
+# ========== HentaiCity ==========
 HC_BASE = "https://www.hentaicity.com"
+# Verified working folder/id pairs (CDN returns 200) used when datacenter IP is blocked
+_HC_SEED = [
+    {"folder": "0267", "vid": "38191", "id": "seed-0267-38191", "title": "Sample stream A (CDN seed)"},
+    {"folder": "0449", "vid": "38135", "id": "seed-0449-38135", "title": "Sample stream B (CDN seed)"},
+    {"folder": "0730", "vid": "38155", "id": "seed-0730-38155", "title": "Sample stream C (CDN seed)"},
+    {"folder": "0131", "vid": "38132", "id": "seed-0131-38132", "title": "Sample stream D (CDN seed)"},
+    {"folder": "0739", "vid": "38186", "id": "seed-0739-38186", "title": "Sample stream E (CDN seed)"},
+]
 
 def _hc_cdn(folder: str, vid: str) -> dict:
-    """Build all direct stream URLs from folder/id (no page fetch needed)."""
     base_flv = f"https://www.hentaicity.com/flv/{folder}/{vid}"
     hls = (
         f"https://hls.hentaicity.com/_hls/flv/{folder}/{vid}/"
         f",default,mobile,480p,720p,1080p,.mp4.urlset/master.m3u8"
     )
     return {
-        "folder": folder,
-        "video_id": vid,
-        "hls": hls,
+        "folder": folder, "video_id": vid, "hls": hls,
         "mp4": {
             "mobile": f"{base_flv}/mobile.mp4",
             "default": f"{base_flv}/default.mp4",
@@ -623,8 +727,7 @@ def _hc_list(html: str) -> list:
             continue
         seen.add(vid_key)
         img = a.find("img")
-        poster = None
-        folder = vid_num = None
+        poster = folder = vid_num = None
         if img:
             poster = img.get("src") or img.get("data-src") or img.get("data-original")
             if poster:
@@ -640,133 +743,126 @@ def _hc_list(html: str) -> list:
             title = vid_key.replace("-", " ")[:90]
         full = href if href.startswith("http") else urljoin(HC_BASE, href)
         item = {
-            "id": vid_key,
-            "slug": slug,
-            "title": title or vid_key,
-            "url": full,
-            "poster": poster,
-            "folder": folder,
-            "numeric_id": vid_num,
+            "id": vid_key, "slug": slug, "title": title, "url": full,
+            "poster": poster, "folder": folder, "numeric_id": vid_num,
         }
         if folder and vid_num:
             item["streams"] = _hc_cdn(folder, vid_num)
         items.append(item)
     return items
 
-def _hc_stream_from_html(html: str) -> list:
-    sources = []
-    for m in re.findall(r'https?://hls\.hentaicity\.com/[^"\'\s<>]+', html):
-        sources.append({"src": m, "format": "hls", "cdn": "hls.hentaicity.com"})
-    for m in re.findall(r'https?://(?:www\.)?hentaicity\.com/flv/\d+/\d+/[^"\'\s<>]+\.mp4', html):
-        sources.append({"src": m, "format": "mp4", "cdn": "hentaicity.com"})
-    fm = re.search(r"/flv/(\d+)/(\d+)/", html) or re.search(r"/videos/(\d+)/(\d+)/", html)
-    if fm:
-        cdn = _hc_cdn(fm.group(1), fm.group(2))
-        sources.insert(0, {"src": cdn["hls"], "format": "hls", "cdn": "hls.hentaicity.com"})
-        for q, u in cdn["mp4"].items():
-            sources.append({"src": u, "format": "mp4", "quality": q, "cdn": "hentaicity.com"})
-    seen = set(); out = []
-    for s in sources:
-        if s["src"] in seen:
-            continue
-        seen.add(s["src"]); out.append(s)
+def _hc_seed_items():
+    out = []
+    for s in _HC_SEED:
+        streams = _hc_cdn(s["folder"], s["vid"])
+        out.append({
+            "id": s["id"], "title": s["title"], "folder": s["folder"], "numeric_id": s["vid"],
+            "poster": streams["poster"], "streams": streams, "seed": True,
+        })
     return out
+
+async def _hc_fetch_list(path: str) -> tuple:
+    """Returns (items, blocked: bool, note)."""
+    headers_list = [
+        {"User-Agent": UA, "Referer": "https://www.google.com/", "Accept": "text/html", "Accept-Language": "en-US,en;q=0.9"},
+        {"User-Agent": MOBILE_UA, "Referer": HC_BASE + "/", "Accept": "text/html"},
+    ]
+    async with _client(22) as client:
+        for headers in headers_list:
+            try:
+                r = await client.get(urljoin(HC_BASE, path), headers=headers)
+                if "defendonlineprivacy" in str(r.url) or "defendonlineprivacy" in r.text[:800]:
+                    continue
+                items = _hc_list(r.text)
+                if items:
+                    return items, False, "live"
+            except Exception:
+                continue
+    return _hc_seed_items(), True, "HentaiCity HTML blocked on this server IP. Returning CDN seed items (real working streams). Use /hc/cdn?folder=&vid= for any id."
 
 @app.get("/hc/recent", tags=["HentaiCity"])
 async def hc_recent():
-    async with _client() as client:
-        r = await client.get(
-            f"{HC_BASE}/videos/straight/all-recent.html",
-            headers={"Referer": "https://www.google.com/", "User-Agent": UA},
-        )
-        items = _hc_list(r.text)
-    return ok(items, provider="hentaicity", level="private", count=len(items), endpoint="recent")
+    items, blocked, note = await _hc_fetch_list("/videos/straight/all-recent.html")
+    return ok(items, provider="hentaicity", level="private", count=len(items), endpoint="recent",
+              blocked=blocked, note=note)
 
 @app.get("/hc/popular", tags=["HentaiCity"])
 async def hc_popular():
-    async with _client() as client:
-        r = await client.get(
-            f"{HC_BASE}/videos/straight/all-popular.html",
-            headers={"Referer": "https://www.google.com/", "User-Agent": UA},
-        )
-        items = _hc_list(r.text)
-    return ok(items, provider="hentaicity", level="private", count=len(items), endpoint="popular")
+    items, blocked, note = await _hc_fetch_list("/videos/straight/all-popular.html")
+    return ok(items, provider="hentaicity", level="private", count=len(items), endpoint="popular",
+              blocked=blocked, note=note)
 
 @app.get("/hc/search", tags=["HentaiCity"])
 async def hc_search(q: str = Query(...)):
-    async with _client() as client:
-        # primary search path from research
-        for path, params in [
-            (f"{HC_BASE}/search/video/{q}", None),
-            (f"{HC_BASE}/search/", {"q": q}),
-        ]:
-            r = await client.get(path, params=params, headers={"Referer": HC_BASE + "/", "User-Agent": UA})
-            items = _hc_list(r.text)
-            if items:
-                break
-    return ok(items, provider="hentaicity", level="private", count=len(items), endpoint="search", query=q)
+    items, blocked, note = await _hc_fetch_list(f"/search/video/{quote(q)}")
+    if not items or blocked:
+        items2, blocked2, note2 = await _hc_fetch_list(f"/search/?q={quote(q)}")
+        if items2 and not blocked2:
+            items, blocked, note = items2, blocked2, note2
+        elif blocked:
+            # seed still useful for CDN try
+            items = _hc_seed_items()
+            note = note or note2
+            blocked = True
+    return ok(items, provider="hentaicity", level="private", count=len(items), endpoint="search", query=q,
+              blocked=blocked, note=note)
 
 @app.get("/hc/watch", tags=["HentaiCity"])
 async def hc_watch(
     id: Optional[str] = None,
     url: Optional[str] = None,
     folder: Optional[str] = None,
-    vid: Optional[str] = Query(None, description="numeric video id inside folder"),
+    vid: Optional[str] = Query(None, description="numeric id inside folder"),
 ):
-    """Resolve HLS + all MP4 qualities. Prefer folder+vid if known (works even when HTML is blocked)."""
     if folder and vid:
         cdn = _hc_cdn(folder, vid)
         sources = [{"src": cdn["hls"], "format": "hls"}] + [
             {"src": u, "format": "mp4", "quality": q} for q, u in cdn["mp4"].items()
         ]
-        return ok(
-            {"id": id, "folder": folder, "vid": vid, "streams": cdn, "sources": sources, "count": len(sources)},
-            provider="hentaicity", level="private", endpoint="watch",
-        )
+        return ok({
+            "id": id, "folder": folder, "vid": vid, "streams": cdn, "sources": sources, "count": len(sources),
+        }, provider="hentaicity", level="private", endpoint="watch")
     if not id and not url:
         raise HTTPException(400, detail=fail("Provide id, url, or folder+vid"))
     pages = []
     if url:
         pages.append(url)
     if id:
-        pages += [
-            f"{HC_BASE}/video/{id}.html",
-            f"{HC_BASE}/click/1-1/video/{id}.html",
-        ]
+        pages += [f"{HC_BASE}/video/{id}.html", f"{HC_BASE}/click/1-1/video/{id}.html"]
     html = ""
     final = pages[0]
     async with _client() as client:
         for page in pages:
-            r = await client.get(page, headers={"Referer": HC_BASE + "/", "User-Agent": UA})
-            html = r.text
-            final = str(r.url)
-            if "defendonlineprivacy" in final or "defendonlineprivacy" in html:
+            try:
+                r = await client.get(page, headers={"Referer": HC_BASE + "/", "User-Agent": UA})
+                html = r.text
+                final = str(r.url)
+                if "defendonlineprivacy" in final:
+                    continue
+                if re.search(r"/flv/(\d+)/(\d+)/", html):
+                    break
+            except Exception:
                 continue
-            if _hc_stream_from_html(html) or re.search(r"/flv/(\d+)/(\d+)/", html):
-                break
-    soup = BeautifulSoup(html, "html.parser")
-    title_el = soup.select_one("h1") or soup.select_one("title")
-    title = title_el.get_text(strip=True) if title_el else id
-    sources = _hc_stream_from_html(html)
     fm = re.search(r"/flv/(\d+)/(\d+)/", html) or re.search(r"/videos/(\d+)/(\d+)/", html)
-    streams = _hc_cdn(fm.group(1), fm.group(2)) if fm else None
-    if not sources and not streams:
-        return ok(
-            {"id": id, "title": title, "page": final, "sources": [], "count": 0,
-             "hint": "HTML blocked on this IP. Use /hc/recent item.streams or /hc/watch?folder=&vid="},
-            provider="hentaicity", level="private", endpoint="watch",
-        )
-    return ok(
-        {"id": id, "title": title, "page": final, "sources": sources, "streams": streams, "count": len(sources)},
-        provider="hentaicity", level="private", endpoint="watch",
-    )
+    if fm:
+        cdn = _hc_cdn(fm.group(1), fm.group(2))
+        sources = [{"src": cdn["hls"], "format": "hls"}] + [
+            {"src": u, "format": "mp4", "quality": q} for q, u in cdn["mp4"].items()
+        ]
+        return ok({
+            "id": id, "page": final, "streams": cdn, "sources": sources, "count": len(sources),
+        }, provider="hentaicity", level="private", endpoint="watch")
+    return ok({
+        "id": id, "page": final, "sources": [], "count": 0,
+        "hint": "HTML blocked. Use /hc/recent item folder+numeric_id → /hc/watch?folder=&vid= or /hc/cdn",
+    }, provider="hentaicity", level="private", endpoint="watch")
 
 @app.get("/hc/cdn", tags=["HentaiCity"])
 async def hc_cdn(folder: str = Query(...), vid: str = Query(...)):
-    """Direct CDN builder — no scrape. folder+vid from /hc/recent item."""
-    cdn = _hc_cdn(folder, vid)
-    return ok(cdn, provider="hentaicity", level="private", endpoint="cdn")
+    """Always works — builds direct HLS + MP4 URLs. No scrape."""
+    return ok(_hc_cdn(folder, vid), provider="hentaicity", level="private", endpoint="cdn")
 
+# ========== Aggregate / Meta ==========
 @app.get("/search", tags=["Aggregate"])
 async def aggregate_search(q: str = Query(..., min_length=1)):
     results = {}
@@ -775,20 +871,22 @@ async def aggregate_search(q: str = Query(..., min_length=1)):
             tok = await _mb_session()
             body = json.dumps({"keyword": q, "page": 1, "perPage": 10})
             data = await _mb_request("POST", "/wefeed-mobile-bff/subject-api/search/v2", body, token=tok)
-            results["moviebox"] = _mb_unwrap(data)
-        except Exception as e: results["moviebox"] = {"error": str(e)}
+            results["moviebox"] = {"items": _mb_items_from_search(_mb_unwrap(data))}
+        except Exception as e:
+            results["moviebox"] = {"error": str(e)}
     async def fk():
         try:
             async with _client() as client:
                 r = await client.get(FK_BASE + "/", params={"s": q})
                 results["4khdhub"] = _fk_cards(r.text)[:20]
-        except Exception as e: results["4khdhub"] = {"error": str(e)}
+        except Exception as e:
+            results["4khdhub"] = {"error": str(e)}
     async def dr():
         try:
-            async with _client() as client:
-                r = await client.get(f"{DR_BASE}/", params={"interface": "search", "q": q, "filter": "all", "page": 1})
-                results["dramachi"] = r.json()
-        except Exception as e: results["dramachi"] = {"error": str(e)}
+            raw = await _dr_search_raw(q, 1, "all")
+            results["dramachi"] = _dr_normalize(raw)
+        except Exception as e:
+            results["dramachi"] = {"error": str(e)}
     await asyncio.gather(mb(), fk(), dr())
     return ok(results, provider="aggregate", level="primary", endpoint="search", query=q)
 
@@ -796,148 +894,159 @@ async def aggregate_search(q: str = Query(..., min_length=1)):
 async def health():
     return ok({"version": VERSION, "providers": ["moviebox", "4khdhub", "hubcloud", "dramachi", "iptv", "hentaicity"]})
 
+# ========== DOCS UI (mobile-first) ==========
 DOCS_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
-<title>StreamHub API · shawon</title>
+<title>StreamHub API</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet"/>
 <style>
-:root{--bg:#09090b;--s1:#141416;--s2:#1c1c1f;--bd:#2e2e33;--tx:#f4f4f5;--mu:#a1a1aa;--ac:#a78bfa;--cy:#22d3ee;--ok:#34d399}
+:root{--bg:#0a0a0c;--card:#141418;--bd:#2a2a32;--tx:#f4f4f5;--mu:#9ca3af;--ac:#8b5cf6;--cy:#22d3ee;--ok:#34d399}
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:Inter,system-ui,sans-serif;background:var(--bg);color:var(--tx);min-height:100vh;
-background-image:radial-gradient(ellipse 90% 60% at 10% -10%,rgba(167,139,250,.22),transparent),radial-gradient(ellipse 70% 50% at 100% 0%,rgba(34,211,238,.12),transparent)}
-a{color:var(--cy)}.layout{display:grid;grid-template-columns:250px 1fr;min-height:100vh}
-@media(max-width:860px){.layout{grid-template-columns:1fr}.side{position:relative;height:auto;border-right:0;border-bottom:1px solid var(--bd)}}
-.side{background:rgba(20,20,22,.9);backdrop-filter:blur(12px);border-right:1px solid var(--bd);padding:18px 14px;position:sticky;top:0;height:100vh;overflow:auto}
-.logo{display:flex;gap:10px;align-items:center;margin-bottom:20px;padding:4px 6px}
-.mark{width:38px;height:38px;border-radius:11px;background:linear-gradient(135deg,#a78bfa,#22d3ee);display:grid;place-items:center;font-weight:700;font-size:13px;animation:pulse 3s ease infinite}
-@keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(167,139,250,.35)}50%{box-shadow:0 0 24px 4px rgba(167,139,250,.25)}}
-.logo h1{font-size:15px;font-weight:700}.logo small{color:var(--mu);font-size:11px}
-.nav-label{font-size:10px;font-weight:600;color:var(--mu);text-transform:uppercase;letter-spacing:.07em;padding:14px 8px 6px}
-.nav a{display:block;padding:8px 10px;border-radius:8px;color:var(--mu);font-size:13px;font-weight:500;margin-bottom:2px;transition:.15s}
-.nav a:hover{background:var(--s2);color:var(--tx);transform:translateX(3px)}
-.main{padding:28px 28px 70px;max-width:900px}
-.hero h2{font-size:26px;font-weight:700;letter-spacing:-.03em;margin-bottom:6px}
-.hero p{color:var(--mu);font-size:14px;margin-bottom:18px}
-.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:20px}
-@media(max-width:600px){.stats{grid-template-columns:1fr 1fr}.main{padding:18px 14px 50px}}
-.stat{background:var(--s1);border:1px solid var(--bd);border-radius:12px;padding:12px 14px;transition:.2s}
-.stat:hover{border-color:#a78bfa66;transform:translateY(-2px)}
-.stat b{font-size:18px;display:block}.stat span{font-size:11px;color:var(--mu)}
-.search{display:flex;gap:8px;align-items:center;background:var(--s1);border:1px solid var(--bd);border-radius:10px;padding:10px 12px;margin-bottom:16px;transition:.2s}
-.search:focus-within{border-color:#a78bfa88;box-shadow:0 0 0 3px #a78bfa22}
+background-image:radial-gradient(ellipse 100% 80% at 50% -30%,rgba(139,92,246,.2),transparent)}
+.top{position:sticky;top:0;z-index:20;background:rgba(10,10,12,.92);backdrop-filter:blur(14px);border-bottom:1px solid var(--bd);padding:12px 16px}
+.brand{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+.logo{width:36px;height:36px;border-radius:10px;background:linear-gradient(135deg,#8b5cf6,#22d3ee);display:grid;place-items:center;font-weight:700;font-size:12px}
+.brand h1{font-size:16px;font-weight:700;line-height:1.2}.brand small{color:var(--mu);font-size:11px}
+.search{display:flex;align-items:center;gap:8px;background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:10px 12px}
+.search:focus-within{border-color:#8b5cf688;box-shadow:0 0 0 3px #8b5cf622}
 .search input{flex:1;border:0;outline:0;background:transparent;color:var(--tx);font:inherit;font-size:14px}
-.sec{font-size:12px;font-weight:600;color:var(--mu);text-transform:uppercase;letter-spacing:.06em;margin:22px 0 10px}
-.ep{background:var(--s1);border:1px solid var(--bd);border-radius:12px;margin-bottom:8px;overflow:hidden;transition:.2s;animation:fadeUp .35s ease both}
-.ep:hover{border-color:#a78bfa55}
-@keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
-.ep-head{display:flex;align-items:center;gap:10px;padding:12px 14px;cursor:pointer;user-select:none}
-.method{font-family:JetBrains Mono,monospace;font-size:10px;font-weight:600;padding:3px 7px;border-radius:5px;background:#22d3ee18;color:var(--cy)}
-.path{font-family:JetBrains Mono,monospace;font-size:12.5px;font-weight:500;flex:1}
-.chev{color:var(--mu);transition:.2s;font-size:12px}.ep.open .chev{transform:rotate(90deg)}
-.ep-body{display:none;padding:0 14px 14px;border-top:1px solid var(--bd)}
-.ep.open .ep-body{display:block;animation:fadeUp .25s ease}
-.how{background:var(--bg);border:1px solid var(--bd);border-radius:8px;padding:10px 12px;margin:10px 0;font-size:12.5px;color:var(--mu);line-height:1.55}
-.how b{color:var(--tx)}.how code{font-family:JetBrains Mono,monospace;font-size:11px;color:var(--ac);background:#a78bfa15;padding:1px 5px;border-radius:4px}
-.row{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}
-.field{flex:1;min-width:120px;background:var(--bg);border:1px solid var(--bd);border-radius:8px;padding:9px 11px;color:var(--tx);font:inherit;font-size:12px;font-family:JetBrains Mono,monospace}
-.btn{background:linear-gradient(135deg,#8b5cf6,#7c3aed);border:0;color:#fff;padding:9px 14px;border-radius:8px;font-weight:600;font-size:12px;cursor:pointer;transition:.15s}
-.btn:hover{filter:brightness(1.1);transform:translateY(-1px)}.ghost{background:transparent;border:1px solid var(--bd);color:var(--tx);padding:9px 12px;border-radius:8px;cursor:pointer;font-size:12px}
-pre{background:#000;border:1px solid var(--bd);border-radius:8px;padding:11px;overflow:auto;max-height:360px;font-family:JetBrains Mono,monospace;font-size:11.5px;line-height:1.5;color:#e4e4e7;white-space:pre-wrap}
-footer{margin-top:36px;padding-top:16px;border-top:1px solid var(--bd);font-size:12px;color:var(--mu);text-align:center}
-</style></head>
+.tabs{display:flex;gap:6px;overflow-x:auto;padding:10px 16px 0;-webkit-overflow-scrolling:touch;scrollbar-width:none}
+.tabs::-webkit-scrollbar{display:none}
+.tab{flex:0 0 auto;padding:7px 12px;border-radius:999px;border:1px solid var(--bd);background:var(--card);color:var(--mu);font-size:12px;font-weight:500;cursor:pointer}
+.tab.on,.tab:hover{border-color:#8b5cf688;color:var(--tx);background:#1a1525}
+.wrap{padding:12px 16px 80px;max-width:720px;margin:0 auto}
+.hint-box{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:12px 14px;margin-bottom:14px;font-size:13px;color:var(--mu);line-height:1.5}
+.hint-box b{color:var(--tx)}
+.ep{background:var(--card);border:1px solid var(--bd);border-radius:12px;margin-bottom:10px;overflow:hidden}
+.ep-h{display:flex;align-items:center;gap:10px;padding:12px 14px;cursor:pointer}
+.m{font-family:JetBrains Mono,monospace;font-size:10px;font-weight:700;padding:3px 7px;border-radius:5px;background:#22d3ee18;color:var(--cy)}
+.p{font-family:JetBrains Mono,monospace;font-size:12px;font-weight:500;flex:1;word-break:break-all}
+.arrow{color:var(--mu);transition:.2s}.ep.open .arrow{transform:rotate(90deg)}
+.ep-b{display:none;padding:0 14px 14px;border-top:1px solid var(--bd)}
+.ep.open .ep-b{display:block}
+.how{margin:10px 0;font-size:12.5px;color:var(--mu);line-height:1.55}
+.how b{color:var(--tx)}.how code{font-family:JetBrains Mono,monospace;font-size:11px;background:#8b5cf618;color:#c4b5fd;padding:1px 5px;border-radius:4px}
+.fields{display:grid;gap:8px;margin:8px 0}
+.field{display:flex;flex-direction:column;gap:4px}
+.field label{font-size:11px;color:var(--mu);font-weight:500}
+.field input{background:var(--bg);border:1px solid var(--bd);border-radius:8px;padding:10px 12px;color:var(--tx);font-family:JetBrains Mono,monospace;font-size:12px}
+.actions{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0}
+.btn{background:linear-gradient(135deg,#8b5cf6,#6d28d9);border:0;color:#fff;padding:10px 16px;border-radius:8px;font-weight:600;font-size:13px;cursor:pointer}
+.btn:active{transform:scale(.98)}.ghost{background:transparent;border:1px solid var(--bd);color:var(--tx);padding:10px 14px;border-radius:8px;font-size:12px;cursor:pointer}
+pre{background:#050506;border:1px solid var(--bd);border-radius:8px;padding:12px;overflow:auto;max-height:320px;font-family:JetBrains Mono,monospace;font-size:11px;line-height:1.5;color:#e4e4e7;white-space:pre-wrap;word-break:break-word}
+.sec{font-size:11px;font-weight:600;color:var(--mu);text-transform:uppercase;letter-spacing:.06em;margin:18px 0 8px}
+.status{font-size:11px;color:var(--ok);margin-top:6px}
+footer{text-align:center;color:var(--mu);font-size:12px;padding:20px 0 10px}
+</style>
+</head>
 <body>
-<div class="layout">
-<aside class="side">
-  <div class="logo"><div class="mark">SH</div><div><h1>StreamHub</h1><small>v7.3.0 · shawon</small></div></div>
-  <div class="nav-label">Providers</div>
-  <nav class="nav">
-    <a href="#MovieBox">MovieBox</a>
-    <a href="#4KHDHub">4KHDHub</a>
-    <a href="#Tools">Tools / CDN</a>
-    <a href="#Dramachi">Dramachi</a>
-    <a href="#IPTV">IPTV</a>
-    <a href="#HentaiCity">HentaiCity</a>
-    <a href="#Aggregate">Aggregate</a>
-  </nav>
-</aside>
-<main class="main">
-  <div class="hero">
-    <h2>API Reference</h2>
-    <p>Expand any endpoint → read how it works → edit URL → <b>Try it</b>. All JSON includes <code>creator: "shawon"</code>.</p>
-  </div>
-  <div class="stats">
-    <div class="stat"><b id="n">0</b><span>Endpoints</span></div>
-    <div class="stat"><b>6</b><span>Providers</span></div>
-    <div class="stat"><b>CDN</b><span>R2 · DASH · HLS · MP4</span></div>
-    <div class="stat"><b>JSON</b><span>Clean responses</span></div>
-  </div>
-  <div class="search"><span style="opacity:.35">/</span><input id="q" placeholder="Filter endpoints…" oninput="filt()"/></div>
+<header class="top">
+  <div class="brand"><div class="logo">SH</div><div><h1>StreamHub API</h1><small>v7.4.0 · creator: shawon</small></div></div>
+  <div class="search"><span style="opacity:.4;font-size:13px">⌕</span><input id="q" placeholder="Filter endpoints…" oninput="filt()"/></div>
+</header>
+<div class="tabs" id="tabs"></div>
+<main class="wrap">
+  <div class="hint-box"><b>How to test:</b> open an endpoint → fill parameters → <b>Try it</b>. Response shows below. Every JSON has <code>creator: "shawon"</code>.</div>
   <div id="list"></div>
-  <footer>StreamHub API · made by shawon</footer>
+  <footer>StreamHub · made by shawon</footer>
 </main>
-</div>
 <script>
-const API=location.origin;
-const E=[
-{g:'MovieBox',p:'/mb/search',d:'Search all titles',h:'Query <code>q</code>. Returns <code>items[].subjectId</code> for play/detail.',t:'/mb/search?q=avatar'},
-{g:'MovieBox',p:'/mb/movies',d:'Search movies only',h:'subjectType=1 filter. Use any keyword <code>q</code>.',t:'/mb/movies?q=love'},
-{g:'MovieBox',p:'/mb/series',d:'Search series only',h:'subjectType=2 filter.',t:'/mb/series?q=love'},
-{g:'MovieBox',p:'/mb/play/{id}',d:'Stream MP4 + DASH',h:'Replace id with subjectId. Use <code>streams</code> where <code>kind=dash</code> and send <code>Cookie</code> header. Optional <code>?se=1&ep=1</code> for series.',t:'/mb/play/1654274595068805784'},
-{g:'MovieBox',p:'/mb/detail/{id}',d:'Full metadata',h:'subjectId from search.',t:'/mb/detail/1654274595068805784'},
-{g:'MovieBox',p:'/mb/resource/{id}',d:'Extra download links',h:'Alternate resourceLink list.',t:'/mb/resource/1654274595068805784'},
-{g:'MovieBox',p:'/mb/seasons/{id}',d:'Season list',h:'Series only.',t:'/mb/seasons/1654274595068805784'},
-{g:'MovieBox',p:'/mb/home',d:'Home feed',h:'tabId default 1. Or use /mb/tab/{1-4}.',t:'/mb/home'},
-{g:'MovieBox',p:'/mb/tab/{tab_id}',d:'Tab feed 1–4',h:'Try tab_id 1,2,3,4 for different home shelves.',t:'/mb/tab/1'},
-{g:'4KHDHub',p:'/fk/home',d:'Latest catalog',h:'Returns cards with <code>id</code> path for detail/stream.',t:'/fk/home'},
-{g:'4KHDHub',p:'/fk/search',d:'Search 4K catalog',h:'<code>q</code> keyword.',t:'/fk/search?q=avatar'},
-{g:'4KHDHub',p:'/fk/detail',d:'Releases + mirrors',h:'path=/slug-movie-123/. Shows GreenMotors mirrors.',t:'/fk/detail?path=/hacksaw-ridge-movie-7809/'},
-{g:'4KHDHub',p:'/fk/stream',d:'Direct CDN resolve',h:'Same path + resolve=true → R2 / gpdl / googleusercontent URLs in <code>direct_streams</code>.',t:'/fk/stream?path=/hacksaw-ridge-movie-7809/&resolve=true'},
-{g:'4KHDHub',p:'/fk/category/{slug}',d:'Category page',h:'slug: movies, series, netflix, anime…',t:'/fk/category/movies'},
-{g:'Tools',p:'/tools/resolve',d:'HubCloud → CDN',h:'Pass hubcloud.ist/drive/… or greenmotors URL. Returns r2.cloudflarestorage direct links.',t:'/tools/resolve?url=https://hubcloud.ist/drive/1qg90m0nr2599rq'},
-{g:'Tools',p:'/tools/pixeldrain',d:'PixelDrain download',h:'File id only → ?download URL.',t:'/tools/pixeldrain?id=GauktM6T'},
-{g:'Dramachi',p:'/dr/search',d:'Drama search',h:'Returns list with thumb filename. No public stream API upstream.',t:'/dr/search?q=love'},
-{g:'Dramachi',p:'/dr/home',d:'Drama home',h:'Home feed if provided by upstream.',t:'/dr/home'},
-{g:'Dramachi',p:'/dr/detail',d:'Detail probe',h:'Tries multiple interfaces; often null. Use /dr/thumb for posters.',t:'/dr/detail?id=524&content=movies'},
-{g:'Dramachi',p:'/dr/thumb',d:'Poster URL',h:'name = thumb from search (e.g. godlovescaviar2012h.jpg).',t:'/dr/thumb?name=godlovescaviar2012h.jpg'},
-{g:'IPTV',p:'/iptv/channels',d:'Live TV M3U',h:'source=0 global, 1=BD, 2=IN. Optional q filter.',t:'/iptv/channels?limit=30'},
-{g:'HentaiCity',p:'/hc/recent',d:'Recent + CDN map',h:'Each item may include <code>streams</code> (hls + all mp4) from poster folder/id.',t:'/hc/recent'},
-{g:'HentaiCity',p:'/hc/popular',d:'Popular list',h:'Same shape as recent.',t:'/hc/popular'},
-{g:'HentaiCity',p:'/hc/search',d:'Search videos',h:'q=keyword.',t:'/hc/search?q=anime'},
-{g:'HentaiCity',p:'/hc/watch',d:'Watch / scrape',h:'id=slug or folder+vid. Prefer folder&vid if HTML blocked.',t:'/hc/watch?folder=0449&vid=38135'},
-{g:'HentaiCity',p:'/hc/cdn',d:'CDN builder only',h:'No scrape. folder + vid → all quality URLs.',t:'/hc/cdn?folder=0267&vid=38191'},
-{g:'Aggregate',p:'/search',d:'Multi search',h:'MovieBox + 4K + Drama in one call.',t:'/search?q=batman'},
-{g:'Meta',p:'/health',d:'Health',h:'Version and provider list.',t:'/health'},
+const API = location.origin;
+const E = [
+{g:'MovieBox',p:'/mb/search',how:'Search all titles. Copy <code>subjectId</code> for play/detail.',params:[{n:'q',v:'avatar'},{n:'page',v:'1'}]},
+{g:'MovieBox',p:'/mb/movies',how:'Movies only (subjectType=1).',params:[{n:'q',v:'love'},{n:'page',v:'1'}]},
+{g:'MovieBox',p:'/mb/series',how:'Series only (subjectType=2).',params:[{n:'q',v:'love'},{n:'page',v:'1'}]},
+{g:'MovieBox',p:'/mb/play/{id}',how:'Returns MP4 + DASH. For DASH send the <code>cookie</code> header. Series: add se & ep.',params:[{n:'id',v:'1654274595068805784',path:true},{n:'se',v:''},{n:'ep',v:''}]},
+{g:'MovieBox',p:'/mb/detail/{id}',how:'Full metadata for a subjectId.',params:[{n:'id',v:'1654274595068805784',path:true}]},
+{g:'MovieBox',p:'/mb/resource/{id}',how:'Extra resource/download links.',params:[{n:'id',v:'1654274595068805784',path:true}]},
+{g:'MovieBox',p:'/mb/seasons/{id}',how:'Season list for series.',params:[{n:'id',v:'1654274595068805784',path:true}]},
+{g:'MovieBox',p:'/mb/home',how:'Home shelves. Optional tab_id 1–4.',params:[{n:'tab_id',v:'1'},{n:'page',v:'1'}]},
+{g:'MovieBox',p:'/mb/tab/{tab_id}',how:'Tab feed: try 1, 2, 3, 4.',params:[{n:'tab_id',v:'1',path:true},{n:'page',v:'1'}]},
+{g:'4KHDHub',p:'/fk/home',how:'Latest catalog cards. Use <code>id</code> path in detail/stream.',params:[]},
+{g:'4KHDHub',p:'/fk/search',how:'Search 4K catalog.',params:[{n:'q',v:'avatar'}]},
+{g:'4KHDHub',p:'/fk/detail',how:'Releases + GreenMotors mirrors.',params:[{n:'path',v:'/hacksaw-ridge-movie-7809/'}]},
+{g:'4KHDHub',p:'/fk/stream',how:'Resolves to R2 / gpdl / googleusercontent CDN. Set resolve=true.',params:[{n:'path',v:'/hacksaw-ridge-movie-7809/'},{n:'resolve',v:'true'}]},
+{g:'4KHDHub',p:'/fk/category/{slug}',how:'Category: movies, series, netflix…',params:[{n:'slug',v:'movies',path:true},{n:'page',v:'1'}]},
+{g:'Tools',p:'/tools/resolve',how:'HubCloud or GreenMotors URL → direct CDN links.',params:[{n:'url',v:'https://hubcloud.ist/drive/1qg90m0nr2599rq'}]},
+{g:'Tools',p:'/tools/pixeldrain',how:'Build PixelDrain download URL from file id.',params:[{n:'id',v:'GauktM6T'}]},
+{g:'Dramachi',p:'/dr/home',how:'Catalog (upstream has no home — uses search). Returns items + poster URLs.',params:[{n:'page',v:'1'},{n:'filter',v:'all'}]},
+{g:'Dramachi',p:'/dr/search',how:'Search dramas/movies. filter=all|movies|series.',params:[{n:'q',v:'love'},{n:'page',v:'1'},{n:'filter',v:'all'}]},
+{g:'Dramachi',p:'/dr/detail',how:'Metadata + poster only. <b>No public stream CDN</b> from Dramachi.',params:[{n:'id',v:'524'},{n:'content',v:'movies'}]},
+{g:'Dramachi',p:'/dr/thumb',how:'Poster from thumb filename in search results.',params:[{n:'name',v:'godlovescaviar2012h.jpg'}]},
+{g:'IPTV',p:'/iptv/channels',how:'Live M3U channels. source 0=global 1=BD 2=IN.',params:[{n:'source',v:'0'},{n:'limit',v:'30'},{n:'q',v:''}]},
+{g:'HentaiCity',p:'/hc/recent',how:'Recent list. If server IP blocked, returns CDN seed items (streams still work).',params:[]},
+{g:'HentaiCity',p:'/hc/popular',how:'Popular list (same shape as recent).',params:[]},
+{g:'HentaiCity',p:'/hc/search',how:'Search. On block falls back to seed CDN items.',params:[{n:'q',v:'anime'}]},
+{g:'HentaiCity',p:'/hc/watch',how:'Best: pass folder + vid from list item. Builds all qualities.',params:[{n:'folder',v:'0267'},{n:'vid',v:'38191'}]},
+{g:'HentaiCity',p:'/hc/cdn',how:'No scrape. Always builds HLS + MP4 links from folder+vid.',params:[{n:'folder',v:'0267'},{n:'vid',v:'38191'}]},
+{g:'Aggregate',p:'/search',how:'MovieBox + 4K + Dramachi in one response.',params:[{n:'q',v:'batman'}]},
+{g:'Meta',p:'/health',how:'Version and provider list.',params:[]},
 ];
-function filt(){const q=(document.getElementById('q').value||'').toLowerCase();
-document.querySelectorAll('.ep').forEach(el=>{el.style.display=!q||(el.dataset.t||'').includes(q)?'':'none'})}
-function render(){
- document.getElementById('n').textContent=E.length; let h='',last='';
- E.forEach((e,i)=>{
-  if(e.g!==last){h+=`<div class="sec" id="${e.g}">${e.g}</div>`;last=e.g}
-  h+=`<div class="ep" style="animation-delay:${(i%8)*0.04}s" data-t="${(e.g+' '+e.p+' '+e.d).toLowerCase()}" id="ep${i}">
-   <div class="ep-head" onclick="tog(${i})"><span class="method">GET</span><span class="path">${e.p}</span><span class="chev">›</span></div>
-   <div class="ep-body"><div class="how"><b>${e.d}</b><br/>${e.h}</div>
-   <div class="row"><input class="field" id="u${i}" value="${API}${e.t}"/>
-   <button class="btn" onclick="run(${i})">Try it</button>
-   <button class="ghost" onclick="navigator.clipboard.writeText(document.getElementById('u${i}').value)">Copy</button></div>
-   <pre id="o${i}">Ready — press Try it</pre></div></div>`;
- });
- document.getElementById('list').innerHTML=h;
+const groups=[...new Set(E.map(e=>e.g))];
+let activeG='ALL';
+function buildUrl(e,i){
+  let path=e.p;
+  const qs=[];
+  (e.params||[]).forEach(pr=>{
+    const el=document.getElementById('f'+i+'_'+pr.n);
+    const val=el?el.value.trim():(pr.v||'');
+    if(pr.path){ path=path.replace('{'+pr.n+'}', encodeURIComponent(val||pr.v)); }
+    else if(val!=='') qs.push(encodeURIComponent(pr.n)+'='+encodeURIComponent(val));
+  });
+  // home uses tab_id as query for /mb/home
+  if(e.p==='/mb/home'){ /* tab_id already in qs */ }
+  return API+path+(qs.length?'?'+qs.join('&'):'');
 }
+function render(){
+  const tabs=document.getElementById('tabs');
+  tabs.innerHTML=['ALL',...groups].map(g=>`<button class="tab ${activeG===g?'on':''}" onclick="setG('${g}')">${g}</button>`).join('');
+  const q=(document.getElementById('q').value||'').toLowerCase();
+  let html='',last='';
+  E.forEach((e,i)=>{
+    if(activeG!=='ALL'&&e.g!==activeG) return;
+    const hay=(e.g+' '+e.p+' '+e.how).toLowerCase();
+    if(q&&!hay.includes(q)) return;
+    if(e.g!==last){html+=`<div class="sec">${e.g}</div>`;last=e.g}
+    const fields=(e.params||[]).map(pr=>`<div class="field"><label>${pr.n}${pr.path?' (path)':''}</label><input id="f${i}_${pr.n}" value="${(pr.v||'').replace(/"/g,'&quot;')}"/></div>`).join('');
+    html+=`<div class="ep" id="ep${i}">
+      <div class="ep-h" onclick="tog(${i})"><span class="m">GET</span><span class="p">${e.p}</span><span class="arrow">›</span></div>
+      <div class="ep-b">
+        <div class="how">${e.how}</div>
+        <div class="fields">${fields}</div>
+        <div class="actions">
+          <button class="btn" onclick="run(${i})">Try it</button>
+          <button class="ghost" onclick="copyUrl(${i})">Copy URL</button>
+        </div>
+        <div class="status" id="st${i}"></div>
+        <pre id="o${i}">Ready</pre>
+      </div></div>`;
+  });
+  document.getElementById('list').innerHTML=html||'<div class="hint-box">No endpoints match filter.</div>';
+}
+function setG(g){activeG=g;render()}
+function filt(){render()}
 function tog(i){const el=document.getElementById('ep'+i);const o=el.classList.contains('open');
- document.querySelectorAll('.ep').forEach(e=>e.classList.remove('open')); if(!o) el.classList.add('open')}
-async function run(i){const u=document.getElementById('u'+i).value;const out=document.getElementById('o'+i);
- out.textContent='Loading…';const t0=performance.now();
- try{const r=await fetch(u);const t=await r.text();let p=t;try{p=JSON.stringify(JSON.parse(t),null,2)}catch(_){}
- out.textContent=r.status+' · '+Math.round(performance.now()-t0)+'ms\\n\\n'+p.slice(0,14000)}catch(e){out.textContent=String(e)}}
+  document.querySelectorAll('.ep').forEach(e=>e.classList.remove('open')); if(!o) el.classList.add('open')}
+function copyUrl(i){navigator.clipboard.writeText(buildUrl(E[i],i))}
+async function run(i){
+  const u=buildUrl(E[i],i); const out=document.getElementById('o'+i); const st=document.getElementById('st'+i);
+  out.textContent='Loading…'; st.textContent='';
+  const t0=performance.now();
+  try{
+    const r=await fetch(u); const t=await r.text();
+    let p=t; try{p=JSON.stringify(JSON.parse(t),null,2)}catch(_){}
+    st.textContent=r.status+' · '+Math.round(performance.now()-t0)+' ms';
+    out.textContent=p.slice(0,16000);
+  }catch(e){st.textContent='error'; out.textContent=String(e)}
+}
 render();
 </script>
 </body></html>
 """
-
 
 @app.get("/docs", response_class=HTMLResponse, include_in_schema=False)
 async def docs_ui():
