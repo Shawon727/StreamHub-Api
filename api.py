@@ -1,4 +1,4 @@
-# StreamHub API v7.7.0 — creator: shawon
+# StreamHub API v7.8.0 — creator: shawon
 from __future__ import annotations
 
 import asyncio, base64, hashlib, hmac, json, random, re, time, uuid
@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
-CREATOR, VERSION = "shawon", "7.7.0"
+CREATOR, VERSION = "shawon", "7.8.0"
 app = FastAPI(title="StreamHub API", version=VERSION, docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -1078,10 +1078,11 @@ async def aggregate_play(q: str = Query(..., min_length=1)):
 HA_BASE = "https://www.hindianime.site"
 HA_STREAM = "https://stream.hindianime.site"
 
-async def _ha_get(path: str, params: dict = None):
+async def _ha_get(path: str, params: dict = None, host: str = None):
+    host = host or HA_BASE
     async with _client(35) as client:
         r = await client.get(
-            urljoin(HA_BASE, path),
+            urljoin(host, path),
             params=params or {},
             headers={
                 "User-Agent": UA,
@@ -1096,52 +1097,129 @@ async def _ha_get(path: str, params: dict = None):
                 return r.json()
             except Exception:
                 return {"raw": r.text[:2000]}
-        # sometimes JSON without header
-        t = r.text.strip()
-        if t.startswith("{") or t.startswith("["):
+        txt = r.text.strip()
+        if txt.startswith("{") or txt.startswith("["):
             try:
-                return json.loads(t)
+                return json.loads(txt)
             except Exception:
                 pass
-        return {"ok_http": r.status_code, "html": True, "raw": t[:500]}
+        return {"ok_http": r.status_code, "html": True, "raw": txt[:400]}
 
 def _ha_abs_stream(url: Optional[str]) -> Optional[str]:
-    if not url:
+    if not url or not isinstance(url, str):
         return None
-    if url.startswith("/api/proxy/") or url.startswith("/api/"):
-        return HA_STREAM + url if url.startswith("/api/proxy/") else HA_BASE + url
+    url = url.strip()
+    if url.startswith("<iframe"):
+        m = re.search(r"src=['\"]([^'\"]+)", url)
+        url = m.group(1) if m else url
+    if url.startswith("/api/proxy/"):
+        return HA_STREAM + url
+    if url.startswith("/api/"):
+        return HA_BASE + url
     if url.startswith("/"):
         return HA_BASE + url
     return url
 
-def _ha_normalize_servers(servers: list) -> list:
-    out = []
-    for s in servers or []:
+def _ha_kind(url: str, declared: str = None) -> str:
+    u = (url or "").lower()
+    d = (declared or "").lower()
+    if "get_video" in u or u.endswith(".mp4") or ".mp4?" in u:
+        return "mp4"
+    if "p2p-master" in u or "/api/proxy/" in u:
+        return "hls_proxy"
+    if ".m3u8" in u or "master.m3u8" in u or "/hls" in u:
+        return "hls"
+    if any(x in u for x in ("streamtape.com/e/", "filesforever", "abyssplayer", "p2pplay", "embed")) or d == "iframe":
+        return "iframe"
+    if d == "direct":
+        return "mp4"
+    return d or "link"
+
+def _ha_push(servers: list, seen: set, name: str, url: str, **extra):
+    abs_u = _ha_abs_stream(url)
+    if not abs_u or abs_u in seen:
+        return
+    # skip dead known p2p error pages as primary later; still list as proxy
+    kind = _ha_kind(abs_u, extra.get("type"))
+    seen.add(abs_u)
+    item = {"name": name, "type": kind, "url": abs_u}
+    for k in ("audio", "langLabel", "streamtapeId", "hash", "source"):
+        if extra.get(k) is not None:
+            item[k] = extra[k]
+    servers.append(item)
+
+async def _ha_probe(url: str) -> dict:
+    """Quick health check — skip dead p2p/zephyrix proxies."""
+    try:
+        async with _client(12) as client:
+            r = await client.get(
+                url,
+                headers={
+                    "User-Agent": UA,
+                    "Referer": HA_BASE + "/watch",
+                    "Origin": HA_BASE,
+                    "Accept": "*/*",
+                },
+            )
+            ct = (r.headers.get("content-type") or "").lower()
+            body = r.text[:200] if r.content else ""
+            dead = (
+                r.status_code in (404, 500, 502, 503)
+                or "p2pplay returned" in body
+                or "temporarily offline" in body
+                or "access denied" in body.lower()
+                or "403 forbidden" in body.lower()
+            )
+            ok_media = (
+                r.status_code in (200, 206)
+                and not dead
+                and (
+                    "mpegurl" in ct
+                    or "application/vnd.apple" in ct
+                    or "video/" in ct
+                    or "octet-stream" in ct
+                    or body.strip().startswith("#EXTM3U")
+                    or (len(r.content) > 500 and "text/html" not in ct)
+                )
+            )
+            return {"url": url, "status": r.status_code, "alive": ok_media and not dead, "dead": dead, "content_type": ct}
+    except Exception as e:
+        return {"url": url, "status": 0, "alive": False, "dead": True, "error": str(e)[:80]}
+
+def _ha_collect_payload(payload: dict, servers: list, seen: set, source: str):
+    if not isinstance(payload, dict) or payload.get("html"):
+        return
+    su = payload.get("streamUrl")
+    if su:
+        _ha_push(servers, seen, payload.get("server") or "Primary", su, type=payload.get("type"), source=source,
+                 hash=payload.get("videoHash"))
+    if payload.get("embedUrl"):
+        _ha_push(servers, seen, "Embed", payload["embedUrl"], type="iframe", source=source)
+    for s in payload.get("servers") or []:
         if not isinstance(s, dict):
             continue
-        u = s.get("url") or s.get("streamUrl")
-        abs_u = _ha_abs_stream(u)
-        kind = s.get("type") or "unknown"
-        if abs_u and ("get_video" in abs_u or abs_u.endswith(".mp4") or ".mp4?" in abs_u):
-            kind = "mp4"
-        elif abs_u and (".m3u8" in abs_u or "master.m3u8" in abs_u):
-            kind = "hls"
-        elif abs_u and ("streamtape.com/e/" in abs_u or "embed" in abs_u or kind == "iframe"):
-            kind = "iframe"
-        out.append({
-            "name": s.get("name"),
-            "type": kind,
-            "url": abs_u,
-            "audio": s.get("audio"),
-            "langLabel": s.get("langLabel"),
-            "streamtapeId": s.get("streamtapeId"),
-        })
-    return out
+        _ha_push(
+            servers, seen,
+            s.get("name") or "Server",
+            s.get("url") or s.get("streamUrl") or "",
+            type=s.get("type"), audio=s.get("audio"), langLabel=s.get("langLabel"),
+            streamtapeId=s.get("streamtapeId"), hash=s.get("hash") or payload.get("videoHash"),
+            source=source,
+        )
+    # hash-only → try both proxy paths
+    vh = payload.get("videoHash")
+    if vh and isinstance(vh, str):
+        for path, name in (
+            (f"/api/proxy/master.m3u8?hash={vh}", "Zephyrix HLS"),
+            (f"/api/proxy/p2p-master.m3u8?hash={vh}", "P2P HLS"),
+        ):
+            _ha_push(servers, seen, name, path, type="hls_proxy", hash=vh, source=source)
 
 @app.get("/ha/catalog", tags=["HindiAnime"])
 async def ha_catalog(kind: str = Query("all", description="all|movies|series")):
+    """Full catalog from hindianime.site — movies + series with posters and watch links."""
     data = await _ha_get("/api/catalog.json")
-    if not isinstance(data, dict):
+    if not isinstance(data, dict) or data.get("html"):
         return fail("catalog failed", provider="hindianime")
     movies = data.get("movies") or []
     series = data.get("series") or []
@@ -1151,12 +1229,12 @@ async def ha_catalog(kind: str = Query("all", description="all|movies|series")):
         return ok({"series": series, "count": len(series)}, provider="hindianime", endpoint="catalog")
     return ok({
         "totalMovies": data.get("totalMovies"), "totalSeries": data.get("totalSeries"),
-        "movies": movies, "series": series,
-        "count": len(movies) + len(series),
+        "movies": movies, "series": series, "count": len(movies) + len(series),
     }, provider="hindianime", level="live", endpoint="catalog")
 
 @app.get("/ha/home", tags=["HindiAnime"])
 async def ha_home():
+    """Home sections: topAiring, mostPopular, latestEpisodes, latestMovies, genres…"""
     data = await _ha_get("/api/home-sections")
     return ok(data, provider="hindianime", level="live", endpoint="home")
 
@@ -1187,8 +1265,9 @@ async def ha_browse():
 
 @app.get("/ha/search", tags=["HindiAnime"])
 async def ha_search(q: str = Query(..., min_length=1)):
+    """Search catalog by title / id / genre."""
     data = await _ha_get("/api/catalog.json")
-    if not isinstance(data, dict):
+    if not isinstance(data, dict) or data.get("html"):
         return fail("catalog failed", provider="hindianime", endpoint="search")
     ql = q.lower().strip()
     items = []
@@ -1200,24 +1279,19 @@ async def ha_search(q: str = Query(..., min_length=1)):
     return ok({"items": items, "count": len(items), "query": q}, provider="hindianime", level="live", endpoint="search")
 
 @app.get("/ha/details", tags=["HindiAnime"])
-async def ha_details(
-    url: Optional[str] = None,
-    id: Optional[str] = None,
-):
-    """Pass url=watchanimeworld link OR id=catalog slug."""
+async def ha_details(url: Optional[str] = None, id: Optional[str] = None):
+    """Episodes + server list. Pass catalog id=slug OR url=watchanimeworld link."""
     if url is not None and not isinstance(url, str):
         url = None
     if id is not None and not isinstance(id, str):
         id = None
-    link = url
-    meta = None
+    link, meta = url, None
     if not link and id:
         cat = await _ha_get("/api/catalog.json")
-        if isinstance(cat, dict):
+        if isinstance(cat, dict) and not cat.get("html"):
             for a in (cat.get("movies") or []) + (cat.get("series") or []):
                 if a.get("id") == id:
-                    link = a.get("link")
-                    meta = a
+                    link, meta = a.get("link"), a
                     break
     if not link:
         raise HTTPException(400, detail=fail("url or id required", provider="hindianime"))
@@ -1227,19 +1301,14 @@ async def ha_details(
     return ok(data, provider="hindianime", level="live", endpoint="details", link=link)
 
 @app.get("/ha/episodes", tags=["HindiAnime"])
-async def ha_episodes(
-    url: Optional[str] = None,
-    id: Optional[str] = None,
-    season: Optional[int] = None,
-):
+async def ha_episodes(url: Optional[str] = None, id: Optional[str] = None, season: Optional[int] = None):
+    """Episode list for a title (optional season filter)."""
     det = await ha_details(url=url, id=id)
     data = det.get("data") or {}
     seasons = data.get("seasons") or {}
     if season is not None:
-        key = str(season)
-        eps = seasons.get(key) or seasons.get(season) or []
+        eps = seasons.get(str(season)) or []
         return ok({"season": season, "episodes": eps, "count": len(eps)}, provider="hindianime", endpoint="episodes")
-    # flatten
     flat = []
     for sk, eps in (seasons.items() if isinstance(seasons, dict) else []):
         for e in eps or []:
@@ -1259,49 +1328,144 @@ async def ha_stream(
     lang: str = "Hindi",
     is_movie: bool = False,
     id: Optional[str] = None,
+    probe: bool = Query(True, description="Health-check links; drops dead p2p/zephyrix"),
 ):
-    """Resolve direct stream servers (streamtape get_video / HLS proxy / embeds)."""
-    # If id given, pull title + link from catalog/details
+    """
+    Resolve playable servers for an episode/movie.
+    - Merges resolve by episode url + title + stream host
+    - Prefers external HLS (non-proxy) when alive
+    - Drops p2p-master links that return HTTP 404/500
+    - Streamtape get_video is IP-locked on many servers → listed as browser/mp4_attempt
+    """
+    ep_meta = None
     if id and not title:
         det = await ha_details(id=id)
         data = det.get("data") or {}
         title = data.get("title") or id
         is_movie = str(data.get("type") or "").upper() == "MOVIE"
-        # pick episode url if series
         seasons = data.get("seasons") or {}
         eps = seasons.get(str(season)) or []
         for e in eps:
-            if int(e.get("episode") or 0) == episode:
+            if int(e.get("episode") or 0) == int(episode):
                 url = e.get("url") or url
+                ep_meta = e
                 break
-    servers = []
-    stream_url = None
-    payload = {}
+        if not url and eps:
+            url = eps[0].get("url")
+            ep_meta = eps[0]
+
+    servers: list = []
+    seen: set = set()
+
+    # 1) resolve by episode page url (often real external m3u8)
     if url:
-        payload = await _ha_get("/api/resolve-stream", {"url": url})
-    if (not payload or not payload.get("success")) and title:
-        payload = await _ha_get("/api/resolve-stream", {
+        p_url = await _ha_get("/api/resolve-stream", {"url": url})
+        _ha_collect_payload(p_url if isinstance(p_url, dict) else {}, servers, seen, "resolve-url")
+        p_stream = await _ha_get("/api/resolve-stream", {"url": url}, host=HA_STREAM)
+        _ha_collect_payload(p_stream if isinstance(p_stream, dict) else {}, servers, seen, "stream-host-url")
+
+    # 2) resolve by title (streamtape + mirrors)
+    if title:
+        p_title = await _ha_get("/api/resolve-stream", {
             "title": title, "season": str(season), "episode": str(episode),
             "lang": lang, "isMovie": "true" if is_movie else "false",
         })
-    if isinstance(payload, dict):
-        stream_url = _ha_abs_stream(payload.get("streamUrl"))
-        servers = _ha_normalize_servers(payload.get("servers") or [])
-        if stream_url and not any(s.get("url") == stream_url for s in servers):
-            kind = "hls" if "m3u8" in stream_url else ("mp4" if "get_video" in stream_url or ".mp4" in stream_url else "link")
-            servers.insert(0, {"name": payload.get("server") or "Primary", "type": kind, "url": stream_url})
-        # also absolute embed
-        if payload.get("embedUrl"):
-            servers.append({"name": "Embed", "type": "iframe", "url": payload.get("embedUrl")})
-    # classify direct CDN
-    direct = [s for s in servers if s.get("type") in ("mp4", "hls") and s.get("url")]
+        _ha_collect_payload(p_title if isinstance(p_title, dict) else {}, servers, seen, "resolve-title")
+        p_title2 = await _ha_get("/api/resolve-stream", {
+            "title": title, "season": str(season), "episode": str(episode),
+            "lang": lang, "isMovie": "true" if is_movie else "false",
+        }, host=HA_STREAM)
+        _ha_collect_payload(p_title2 if isinstance(p_title2, dict) else {}, servers, seen, "stream-host-title")
+
+    # 3) episode servers from details (abyss / filesforever / p2p iframe)
+    if ep_meta:
+        for s in ep_meta.get("servers") or []:
+            if not isinstance(s, dict):
+                continue
+            raw = s.get("url") or ""
+            if raw.startswith("/api/clean-abyss"):
+                # clean-abyss is an HTML player wrapper — expose abyss + stream clean URL
+                m = re.search(r"[?&]v=([^&]+)", raw)
+                if m:
+                    vid = m.group(1)
+                    _ha_push(servers, seen, "Abyss Player", f"https://play.abyssplayer.com/{vid}", type="iframe", source="details")
+                    _ha_push(servers, seen, "Clean Abyss page", HA_STREAM + f"/api/clean-abyss?v={vid}", type="iframe", source="details")
+            else:
+                _ha_push(servers, seen, s.get("name") or "Detail server", raw, type=s.get("type"), audio=s.get("audio"), source="details")
+        if ep_meta.get("abyssId"):
+            vid = ep_meta["abyssId"]
+            _ha_push(servers, seen, "Abyss", f"https://play.abyssplayer.com/{vid}", type="iframe", source="details")
+
+    # probe + rank
+    probes = []
+    if probe:
+        candidates = [s for s in servers if s.get("type") in ("hls", "hls_proxy", "mp4") and s.get("url")]
+        results = await asyncio.gather(*[_ha_probe(s["url"]) for s in candidates]) if candidates else []
+        by_url = {r["url"]: r for r in results}
+        probes = results
+        for s in servers:
+            pr = by_url.get(s["url"])
+            if pr:
+                s["alive"] = pr.get("alive")
+                s["http_status"] = pr.get("status")
+                if pr.get("dead"):
+                    s["dead"] = True
+
+    def rank(s):
+        # lower is better
+        alive = s.get("alive") is True
+        dead = s.get("dead") is True
+        t = s.get("type")
+        u = s.get("url") or ""
+        if dead:
+            return 90
+        if alive and t == "hls" and "proxy" not in u:
+            return 0
+        if alive and t == "mp4":
+            return 1
+        if alive and t == "hls_proxy":
+            return 2
+        if t == "iframe":
+            return 3
+        if t == "hls" and "proxy" not in u:
+            return 4
+        if t == "mp4":
+            return 5
+        if t == "hls_proxy":
+            return 6
+        return 10
+
+    ranked = sorted(servers, key=rank)
+    # working direct = alive hls/mp4, or non-proxy hls even if probe skipped
+    direct = []
+    for s in ranked:
+        if s.get("dead"):
+            continue
+        if s.get("type") in ("hls", "mp4") and "p2p-master" not in (s.get("url") or ""):
+            if probe and s.get("type") in ("hls", "mp4") and s.get("alive") is False:
+                continue
+            direct.append(s)
+        elif s.get("type") == "hls_proxy" and s.get("alive") is True:
+            direct.append(s)
+
     return ok({
-        "title": title, "season": season, "episode": episode, "lang": lang,
-        "streamUrl": stream_url,
-        "servers": servers, "direct": direct, "direct_count": len(direct),
-        "raw": {k: payload.get(k) for k in ("success", "videoHash", "server") if isinstance(payload, dict)},
-    }, provider="hindianime", level="live", endpoint="stream",
-       note="Prefer servers type=mp4 (streamtape get_video) or type=hls. Embeds need browser.")
+        "title": title,
+        "season": season,
+        "episode": episode,
+        "lang": lang,
+        "episode_url": url,
+        "servers": ranked,
+        "direct": direct,
+        "direct_count": len(direct),
+        "embeds": [s for s in ranked if s.get("type") == "iframe"],
+        "probes": probes if probe else [],
+        "how": (
+            "1) Use data.direct[] first (alive HLS/MP4). "
+            "2) Skip URLs with dead=true or p2pplay 404. "
+            "3) Streamtape get_video often IP-locked — open iframe embeds in browser/WebView. "
+            "4) Set probe=false to skip health checks."
+        ),
+    }, provider="hindianime", level="live", endpoint="stream", creator="shawon")
 
 @app.get("/ha/trailer", tags=["HindiAnime"])
 async def ha_trailer(title: str = Query(...)):
@@ -1310,13 +1474,20 @@ async def ha_trailer(title: str = Query(...)):
 
 @app.get("/ha/proxy", tags=["HindiAnime"])
 async def ha_proxy(hash: str = Query(..., description="videoHash from resolve-stream")):
-    """Absolute HLS proxy URL for p2p-master (may be offline upstream)."""
+    """Build HLS proxy URLs. Many hashes return p2p 404 or zephyrix offline — always probe."""
     urls = [
-        f"{HA_STREAM}/api/proxy/p2p-master.m3u8?hash={hash}",
-        f"{HA_BASE}/api/proxy/p2p-master.m3u8?hash={hash}",
         f"{HA_STREAM}/api/proxy/master.m3u8?hash={hash}",
+        f"{HA_STREAM}/api/proxy/p2p-master.m3u8?hash={hash}",
     ]
-    return ok({"hash": hash, "hls_urls": urls}, provider="hindianime", endpoint="proxy")
+    probes = await asyncio.gather(*[_ha_probe(u) for u in urls])
+    alive = [p for p in probes if p.get("alive")]
+    return ok({
+        "hash": hash,
+        "hls_urls": urls,
+        "probes": probes,
+        "alive": alive,
+        "how": "Only use alive[].url. p2pplay HTTP 404 means that hash is dead upstream.",
+    }, provider="hindianime", endpoint="proxy")
 
 
 @app.get("/search", tags=["Aggregate"])
@@ -1401,7 +1572,7 @@ footer{text-align:center;color:var(--mu);font-size:12px;padding:20px 0 10px}
 </head>
 <body>
 <header class="top">
-  <div class="brand"><div class="logo">SH</div><div><h1>StreamHub API</h1><small>v7.7.0 · creator: shawon</small></div></div>
+  <div class="brand"><div class="logo">SH</div><div><h1>StreamHub API</h1><small>v7.8.0 · creator: shawon</small></div></div>
   <div class="search"><span style="opacity:.4;font-size:13px">⌕</span><input id="q" placeholder="Filter endpoints…" oninput="filt()"/></div>
 </header>
 <div class="tabs" id="tabs"></div>
@@ -1413,52 +1584,49 @@ footer{text-align:center;color:var(--mu);font-size:12px;padding:20px 0 10px}
 <script>
 const API = location.origin;
 const E = [
-{g:'MovieBox',p:'/mb/search',how:'Search all titles. Copy <code>subjectId</code> for play/detail.',params:[{n:'q',v:'avatar'},{n:'page',v:'1'}]},
+{g:'MovieBox',p:'/mb/search',how:'Search titles. Copy subjectId → play/cdn/detail.',params:[{n:'q',v:'avatar'},{n:'page',v:'1'}]},
 {g:'MovieBox',p:'/mb/movies',how:'Movies only (subjectType=1).',params:[{n:'q',v:'love'},{n:'page',v:'1'}]},
-{g:'MovieBox',p:'/mb/series',how:'Series only (subjectType=2).',params:[{n:'q',v:'love'},
-{g:'MovieBox',p:'/mb/adult',how:'18+ search. Genre filtered Adult/Erotic. Default q=sex.',params:[{n:'q',v:'sex'},{n:'page',v:'1'}]},
-{g:'MovieBox',p:'/mb/adult/home',how:'Curated adult home (tabId=9 — Porn Top Videos shelves).',params:[{n:'page',v:'1'}]},
-{n:'page',v:'1'}]},
-{g:'MovieBox',p:'/mb/play/{id}',how:'Returns MP4 + DASH. For DASH send the <code>cookie</code> header. Series: add se & ep.',params:[{n:'id',v:'1654274595068805784',path:true},
-{g:'MovieBox',p:'/mb/cdn/{id}',how:'All MP4 + DASH CDN for a subjectId (play + resource).',params:[{n:'id',v:'1654274595068805784',path:true}]},
-{g:'MovieBox',p:'/mb/mp4/{id}',how:'Only direct MP4 CDN URL list.',params:[{n:'id',v:'1654274595068805784',path:true}]},
-{g:'Tools',p:'/tools/mp4',how:'Extract every MP4/MKV/M3U8/CDN from a page or mirror URL.',params:[{n:'url',v:'https://hubcloud.ist/drive/1qg90m0nr2599rq'}]},
-{g:'Tools',p:'/tools/cdn-types',how:'Known CDN host patterns.',params:[]},
-{g:'Aggregate',p:'/play',how:'Search + MovieBox full CDN + 4K paths in one call.',params:[{n:'q',v:'avatar'}]},
-{n:'se',v:''},{n:'ep',v:''}]},
-{g:'MovieBox',p:'/mb/detail/{id}',how:'Full metadata for a subjectId.',params:[{n:'id',v:'1654274595068805784',path:true}]},
-{g:'MovieBox',p:'/mb/resource/{id}',how:'Extra resource/download links.',params:[{n:'id',v:'1654274595068805784',path:true}]},
+{g:'MovieBox',p:'/mb/series',how:'Series only (subjectType=2).',params:[{n:'q',v:'love'},{n:'page',v:'1'}]},
+{g:'MovieBox',p:'/mb/adult',how:'18+ search (Adult/Erotic genres).',params:[{n:'q',v:'sex'},{n:'page',v:'1'}]},
+{g:'MovieBox',p:'/mb/adult/home',how:'Curated adult home (tabId=9).',params:[{n:'page',v:'1'}]},
+{g:'MovieBox',p:'/mb/home',how:'Home shelves. tab_id 1–4.',params:[{n:'tab_id',v:'1'},{n:'page',v:'1'}]},
+{g:'MovieBox',p:'/mb/tab/{tab_id}',how:'Raw tab feed.',params:[{n:'tab_id',v:'1',path:true},{n:'page',v:'1'}]},
+{g:'MovieBox',p:'/mb/detail/{id}',how:'Full metadata for subjectId.',params:[{n:'id',v:'1654274595068805784',path:true}]},
 {g:'MovieBox',p:'/mb/seasons/{id}',how:'Season list for series.',params:[{n:'id',v:'1654274595068805784',path:true}]},
-{g:'MovieBox',p:'/mb/home',how:'Home shelves. Optional tab_id 1–4.',params:[{n:'tab_id',v:'1'},{n:'page',v:'1'}]},
-{g:'MovieBox',p:'/mb/tab/{tab_id}',how:'Tab feed: try 1, 2, 3, 4.',params:[{n:'tab_id',v:'1',path:true},{n:'page',v:'1'}]},
-{g:'4KHDHub',p:'/fk/home',how:'Latest catalog cards. Use <code>id</code> path in detail/stream.',params:[]},
+{g:'MovieBox',p:'/mb/play/{id}',how:'MP4 + DASH streams. DASH needs Cookie header.',params:[{n:'id',v:'1654274595068805784',path:true},{n:'se',v:''},{n:'ep',v:''}]},
+{g:'MovieBox',p:'/mb/cdn/{id}',how:'All MP4 + DASH CDN (play + resource).',params:[{n:'id',v:'1654274595068805784',path:true}]},
+{g:'MovieBox',p:'/mb/mp4/{id}',how:'Only direct MP4 CDN URLs.',params:[{n:'id',v:'1654274595068805784',path:true}]},
+{g:'MovieBox',p:'/mb/resource/{id}',how:'Extra resource/download links.',params:[{n:'id',v:'1654274595068805784',path:true}]},
+{g:'4KHDHub',p:'/fk/home',how:'Latest catalog cards.',params:[]},
 {g:'4KHDHub',p:'/fk/search',how:'Search 4K catalog.',params:[{n:'q',v:'avatar'}]},
 {g:'4KHDHub',p:'/fk/detail',how:'Releases + GreenMotors mirrors.',params:[{n:'path',v:'/hacksaw-ridge-movie-7809/'}]},
-{g:'4KHDHub',p:'/fk/stream',how:'Resolves to R2 / gpdl / googleusercontent CDN. Set resolve=true.',params:[{n:'path',v:'/hacksaw-ridge-movie-7809/'},{n:'resolve',v:'true'}]},
+{g:'4KHDHub',p:'/fk/stream',how:'Resolve R2 / gpdl / googleusercontent CDN. resolve=true.',params:[{n:'path',v:'/hacksaw-ridge-movie-7809/'},{n:'resolve',v:'true'}]},
 {g:'4KHDHub',p:'/fk/category/{slug}',how:'Category: movies, series, netflix…',params:[{n:'slug',v:'movies',path:true},{n:'page',v:'1'}]},
-{g:'Tools',p:'/tools/resolve',how:'HubCloud or GreenMotors URL → direct CDN links.',params:[{n:'url',v:'https://hubcloud.ist/drive/1qg90m0nr2599rq'}]},
-{g:'Tools',p:'/tools/pixeldrain',how:'Build PixelDrain download URL from file id.',params:[{n:'id',v:'GauktM6T'}]},
-{g:'Dramachi',p:'/dr/home',how:'Catalog (upstream has no home — uses search). Returns items + poster URLs.',params:[{n:'page',v:'1'},{n:'filter',v:'all'}]},
-{g:'Dramachi',p:'/dr/search',how:'Search dramas/movies. filter=all|movies|series.',params:[{n:'q',v:'love'},{n:'page',v:'1'},{n:'filter',v:'all'}]},
-{g:'Dramachi',p:'/dr/detail',how:'Metadata + poster only. <b>No public stream CDN</b> from Dramachi.',params:[{n:'id',v:'524'},{n:'content',v:'movies'}]},
-{g:'Dramachi',p:'/dr/thumb',how:'Poster from thumb filename in search results.',params:[{n:'name',v:'godlovescaviar2012h.jpg'}]},
-{g:'IPTV',p:'/iptv/channels',how:'Live M3U channels. source 0=global 1=BD 2=IN.',params:[{n:'source',v:'0'},{n:'limit',v:'30'},{n:'q',v:''}]},
-{g:'HentaiCity',p:'/hc/recent',how:'Recent list. If server IP blocked, returns CDN seed items (streams still work).',params:[]},
-{g:'HentaiCity',p:'/hc/popular',how:'Popular list (same shape as recent).',params:[]},
-{g:'HentaiCity',p:'/hc/search',how:'Search. On block falls back to seed CDN items.',params:[{n:'q',v:'anime'}]},
-{g:'HentaiCity',p:'/hc/watch',how:'Best: pass folder + vid from list item. Builds all qualities.',params:[{n:'folder',v:'0267'},{n:'vid',v:'38191'}]},
-{g:'HindiAnime',p:'/ha/catalog',how:'Full movies+series catalog from hindianime.site',params:[{n:'kind',v:'all'}]},
-{g:'HindiAnime',p:'/ha/home',how:'Home sections: topAiring, popular, latest…',params:[]},
+{g:'Tools',p:'/tools/resolve',how:'HubCloud / GreenMotors URL → direct CDN.',params:[{n:'url',v:'https://hubcloud.ist/drive/1qg90m0nr2599rq'}]},
+{g:'Tools',p:'/tools/pixeldrain',how:'PixelDrain download URL from file id.',params:[{n:'id',v:'GauktM6T'}]},
+{g:'Tools',p:'/tools/mp4',how:'Extract MP4/MKV/M3U8 links from a page.',params:[{n:'url',v:'https://hubcloud.ist/drive/1qg90m0nr2599rq'}]},
+{g:'Tools',p:'/tools/cdn-types',how:'Known CDN host patterns.',params:[]},
+{g:'Dramachi',p:'/dr/home',how:'Catalog via search fallback.',params:[{n:'page',v:'1'},{n:'filter',v:'all'}]},
+{g:'Dramachi',p:'/dr/search',how:'Search dramas/movies.',params:[{n:'q',v:'love'},{n:'page',v:'1'},{n:'filter',v:'all'}]},
+{g:'Dramachi',p:'/dr/detail',how:'Metadata only (no public stream CDN).',params:[{n:'id',v:'524'},{n:'content',v:'movies'}]},
+{g:'Dramachi',p:'/dr/thumb',how:'Poster by thumb filename.',params:[{n:'name',v:'godlovescaviar2012h.jpg'}]},
+{g:'IPTV',p:'/iptv/channels',how:'Live M3U. source 0=global 1=BD 2=IN.',params:[{n:'source',v:'0'},{n:'limit',v:'30'},{n:'q',v:''}]},
+{g:'HentaiCity',p:'/hc/recent',how:'Recent list (seed CDN if IP blocked).',params:[]},
+{g:'HentaiCity',p:'/hc/popular',how:'Popular list.',params:[]},
+{g:'HentaiCity',p:'/hc/search',how:'Search (seed fallback on block).',params:[{n:'q',v:'anime'}]},
+{g:'HentaiCity',p:'/hc/watch',how:'Build streams from folder+vid.',params:[{n:'folder',v:'0267'},{n:'vid',v:'38191'}]},
+{g:'HentaiCity',p:'/hc/cdn',how:'Always builds HLS+MP4 from folder+vid.',params:[{n:'folder',v:'0267'},{n:'vid',v:'38191'}]},
+{g:'HindiAnime',p:'/ha/catalog',how:'Full movies+series catalog (hindianime.site).',params:[{n:'kind',v:'all'}]},
+{g:'HindiAnime',p:'/ha/home',how:'Home: topAiring, popular, latest…',params:[]},
 {g:'HindiAnime',p:'/ha/search',how:'Search catalog by title/genre.',params:[{n:'q',v:'naruto'}]},
-{g:'HindiAnime',p:'/ha/details',how:'Episodes + servers. Pass id=slug or url=watchanimeworld link.',params:[{n:'id',v:'clevatess'}]},
-{g:'HindiAnime',p:'/ha/episodes',how:'Episode list for a title.',params:[{n:'id',v:'clevatess'},{n:'season',v:'1'}]},
-{g:'HindiAnime',p:'/ha/stream',how:'Direct stream servers (mp4 get_video / hls / iframe).',params:[{n:'id',v:'clevatess'},{n:'season',v:'1'},{n:'episode',v:'1'},{n:'lang',v:'Hindi'}]},
-{g:'HindiAnime',p:'/ha/hero',how:'Hero carousel JSON',params:[]},
-{g:'HindiAnime',p:'/ha/top10',how:'Trending + popular',params:[]},
-{g:'HindiAnime',p:'/ha/spotlights',how:'Spotlight rotation',params:[]},
-{g:'HindiAnime',p:'/ha/trailer',how:'YouTube trailer lookup',params:[{n:'title',v:'naruto'}]},
-{g:'HindiAnime',p:'/ha/proxy',how:'Build HLS proxy URLs from videoHash',params:[{n:'hash',v:'kqdr8'}]},
-{g:'HentaiCity',p:'/hc/cdn',how:'No scrape. Always builds HLS + MP4 links from folder+vid.',params:[{n:'folder',v:'0267'},{n:'vid',v:'38191'}]},
+{g:'HindiAnime',p:'/ha/details',how:'Episodes + servers. id=slug or url=link.',params:[{n:'id',v:'clevatess'}]},
+{g:'HindiAnime',p:'/ha/episodes',how:'Episode list. Optional season.',params:[{n:'id',v:'clevatess'},{n:'season',v:'1'}]},
+{g:'HindiAnime',p:'/ha/stream',how:'Playable servers. Uses data.direct[] (alive HLS). Dead p2p (404) dropped. probe=true by default.',params:[{n:'id',v:'solo-leveling'},{n:'season',v:'1'},{n:'episode',v:'1'},{n:'lang',v:'Hindi'},{n:'probe',v:'true'}]},
+{g:'HindiAnime',p:'/ha/hero',how:'Hero carousel JSON.',params:[]},
+{g:'HindiAnime',p:'/ha/top10',how:'Trending + popular.',params:[]},
+{g:'HindiAnime',p:'/ha/spotlights',how:'Spotlight rotation.',params:[]},
+{g:'HindiAnime',p:'/ha/trailer',how:'YouTube trailer lookup.',params:[{n:'title',v:'naruto'}]},
+{g:'HindiAnime',p:'/ha/proxy',how:'HLS proxy URLs for a videoHash + probe status.',params:[{n:'hash',v:'kqdr8'}]},
 {g:'Aggregate',p:'/search',how:'MovieBox + 4K + Dramachi in one response.',params:[{n:'q',v:'batman'}]},
 {g:'Meta',p:'/health',how:'Version and provider list.',params:[]},
 ];
