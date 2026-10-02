@@ -1,4 +1,4 @@
-# StreamHub API v7.5.0 — creator: shawon
+# StreamHub API v7.7.0 — creator: shawon
 from __future__ import annotations
 
 import asyncio, base64, hashlib, hmac, json, random, re, time, uuid
@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
-CREATOR, VERSION = "shawon", "7.5.0"
+CREATOR, VERSION = "shawon", "7.7.0"
 app = FastAPI(title="StreamHub API", version=VERSION, docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -286,6 +286,76 @@ async def mb_play(subject_id: str, se: Optional[int] = None, ep: Optional[int] =
     }, provider="moviebox", level="primary", endpoint="play",
        note="kind=dash needs Cookie header; kind=mp4 is direct URL")
 
+
+@app.get("/mb/cdn/{subject_id}", tags=["MovieBox"])
+async def mb_cdn(subject_id: str, se: Optional[int] = None, ep: Optional[int] = None):
+    """All MovieBox CDN links: play MP4, DASH (with cookie), resource mirrors."""
+    tok = await _mb_session()
+    if se is not None and ep is not None:
+        play_path = f"/wefeed-mobile-bff/subject-api/play-info/v2?subjectId={subject_id}&se={se}&ep={ep}"
+        res_path = f"/wefeed-mobile-bff/subject-api/resource?subjectId={subject_id}&se={se}&ep={ep}&page=1&perPage=20"
+    else:
+        play_path = f"/wefeed-mobile-bff/subject-api/play-info/v2?subjectId={subject_id}"
+        res_path = f"/wefeed-mobile-bff/subject-api/resource?subjectId={subject_id}&page=1&perPage=20"
+    play_data = await _mb_request("GET", play_path, token=tok)
+    res_data = await _mb_request("GET", res_path, token=tok)
+    inner = _mb_unwrap(play_data)
+    streams = _mb_streams(play_data)
+    mp4s = []
+    dashes = []
+    for s in streams:
+        if s.get("kind") == "dash":
+            dashes.append(s)
+        else:
+            mp4s.append({
+                "url": s.get("url"), "quality": s.get("quality"), "codec": s.get("codec"),
+                "format": s.get("format") or "MP4", "size": s.get("size"), "cookie": s.get("cookie"),
+                "kind": "mp4", "source": "play",
+            })
+    resources = []
+    for item in (_mb_unwrap(res_data).get("list") or []):
+        link = item.get("resourceLink") or item.get("url")
+        if not link:
+            continue
+        resources.append({
+            "url": link, "quality": item.get("resolution"), "codec": item.get("codecName"),
+            "size": item.get("size"), "title": item.get("title"), "sourceUrl": item.get("sourceUrl"),
+            "kind": "mp4" if ".mp4" in str(link).lower() else "link", "source": "resource",
+        })
+        if link not in [m.get("url") for m in mp4s]:
+            mp4s.append({
+                "url": link, "quality": item.get("resolution"), "codec": item.get("codecName"),
+                "size": item.get("size"), "kind": "mp4" if ".mp4" in str(link).lower() else "link",
+                "source": "resource",
+            })
+    # unique mp4 by url
+    seen = set()
+    uniq_mp4 = []
+    for m in mp4s:
+        u = m.get("url")
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        uniq_mp4.append(m)
+    return ok({
+        "subject_id": subject_id, "title": inner.get("title"),
+        "mp4": uniq_mp4, "dash": dashes, "resources": resources,
+        "mp4_count": len(uniq_mp4), "dash_count": len(dashes),
+        "displayResolutions": inner.get("displayResolutions"),
+    }, provider="moviebox", level="primary", endpoint="cdn",
+       note="mp4 = direct CDN; dash needs Cookie header from each item")
+
+@app.get("/mb/mp4/{subject_id}", tags=["MovieBox"])
+async def mb_mp4(subject_id: str, se: Optional[int] = None, ep: Optional[int] = None):
+    """Only direct MP4 CDN URLs (macdn / resource)."""
+    data = await mb_cdn(subject_id, se=se, ep=ep)
+    payload = data.get("data") or {}
+    only = [x for x in (payload.get("mp4") or []) if x.get("url")]
+    return ok({
+        "subject_id": subject_id, "title": payload.get("title"),
+        "urls": [x["url"] for x in only], "items": only, "count": len(only),
+    }, provider="moviebox", level="primary", endpoint="mp4")
+
 @app.get("/mb/resource/{subject_id}", tags=["MovieBox"])
 async def mb_resource(subject_id: str, se: Optional[int] = None, ep: Optional[int] = None, page: int = 1, per_page: int = 20):
     tok = await _mb_session()
@@ -395,6 +465,11 @@ def _extract_cdn_urls(html):
         r'https://[^"\'\s<>]*googleusercontent\.com/[^"\'\s<>]+',
         r'https://pixeldrain\.(?:com|dev)/(?:u|api/file)/[A-Za-z0-9_-]+',
         r'https://[^"\'\s<>]+\.workers\.dev/[^"\'\s<>]+',
+        r'https://macdn\.aoneroom\.com/[^"\'\s<>]+\.mp4[^"\'\s<>]*',
+        r'https://sbcdn\d*\.hakunaymatata\.com/[^"\'\s<>]+',
+        r'https://[^"\'\s<>]+\.(?:mp4|mkv|m3u8)(?:\?[^"\'\s<>]*)?',
+        r'https://cdn\d*\.[^"\'\s<>]+/(?:[^"\'\s<>]+\.(?:mp4|mkv))',
+        r'https://[^"\'\s<>]*hubcloud[^"\'\s<>]*/(?:file|drive|download)[^"\'\s<>]*',
     ]
     for pat in patterns:
         for m in re.findall(pat, html):
@@ -579,6 +654,59 @@ async def tools_pixeldrain(id: str = Query(...)):
         "info_url": f"https://pixeldrain.com/api/file/{id}",
         "alt": f"https://pixeldrain.dev/api/file/{id}?download",
     }, provider="tools", level="tool", endpoint="pixeldrain")
+
+
+@app.get("/tools/mp4", tags=["Tools"])
+async def tools_mp4(url: str = Query(..., description="Any page or media URL")):
+    """Extract all MP4 / MKV / M3U8 / known CDN links from a page or return direct media URL."""
+    u = url.strip()
+    low = u.lower()
+    direct = []
+    if any(low.endswith(ext) or ext in low for ext in (".mp4", ".mkv", ".m3u8", ".mpd")):
+        direct.append({"url": u, "kind": "direct", "format": low.rsplit(".", 1)[-1][:4]})
+    if "pixeldrain." in low:
+        direct.append({"url": _pixeldrain_api(u) or u, "kind": "direct", "format": "file"})
+    page_links = []
+    if not direct or "hubcloud" in low or "greenmotors" in low or "http" in low:
+        try:
+            if "greenmotors." in low:
+                page_links = await _resolve_greenmotors(u)
+            elif "hubcloud." in low:
+                page_links = await _resolve_hubcloud(u)
+            elif "hubdrive." in low:
+                page_links = await _resolve_hubdrive(u)
+            else:
+                async with _client(30) as client:
+                    r = await client.get(u, headers={"User-Agent": UA, "Referer": "https://www.google.com/"})
+                    for found in _extract_cdn_urls(r.text):
+                        page_links.append({"url": found, "kind": "extracted", "label": "CDN"})
+                    for m in re.findall(r'https?://[^\s"\'<>]+\.(?:mp4|mkv|m3u8)(?:\?[^\s"\'<>]*)?', r.text):
+                        page_links.append({"url": m.replace("&amp;", "&"), "kind": "media", "label": "file"})
+        except Exception as e:
+            return fail(str(e), input=u, provider="tools", endpoint="mp4")
+    all_links = direct + page_links
+    seen = set()
+    uniq = []
+    for x in all_links:
+        uu = x.get("url") if isinstance(x, dict) else x
+        if not uu or uu in seen:
+            continue
+        seen.add(uu)
+        uniq.append(x if isinstance(x, dict) else {"url": uu, "kind": "link"})
+    return ok({"input": u, "links": uniq, "count": len(uniq)}, provider="tools", level="tool", endpoint="mp4")
+
+@app.get("/tools/cdn-types", tags=["Tools"])
+async def tools_cdn_types():
+    """List known CDN host patterns this API can resolve."""
+    return ok({
+        "moviebox_mp4": ["macdn.aoneroom.com"],
+        "moviebox_dash": ["sbcdn*.hakunaymatata.com", "Edge-Cache-Cookie required"],
+        "hubcloud": ["*.r2.cloudflarestorage.com", "gpdl.hubcloud.ist", "googleusercontent.com"],
+        "pixeldrain": ["pixeldrain.com/api/file/{id}?download"],
+        "hentaicity": ["hentaicity.com/flv/{folder}/{id}/*.mp4", "hls.hentaicity.com"],
+        "iptv": ["*.m3u8 from iptv-org"],
+    }, provider="tools", endpoint="cdn-types")
+
 
 # ========== Dramachi (search works; home uses search catalog) ==========
 DR_BASE = "https://api.nodeobjects.com"
@@ -920,6 +1048,277 @@ async def hc_cdn(folder: str = Query(...), vid: str = Query(...)):
     return ok(_hc_cdn(folder, vid), provider="hentaicity", level="private", endpoint="cdn")
 
 # ========== Aggregate / Meta ==========
+
+@app.get("/play", tags=["Aggregate"])
+async def aggregate_play(q: str = Query(..., min_length=1)):
+    """Search then return MovieBox CDN (mp4+dash) for first result + 4KHDHub paths."""
+    out = {"query": q, "moviebox": None, "4khdhub": None}
+    try:
+        tok = await _mb_session()
+        body = json.dumps({"keyword": q, "page": 1, "perPage": 5})
+        data = await _mb_request("POST", "/wefeed-mobile-bff/subject-api/search/v2", body, token=tok)
+        items = _mb_items_from_search(_mb_unwrap(data))
+        if items:
+            sid = items[0]["subjectId"]
+            cdn = await mb_cdn(sid)
+            out["moviebox"] = {"item": items[0], "cdn": cdn.get("data")}
+    except Exception as e:
+        out["moviebox"] = {"error": str(e)}
+    try:
+        async with _client() as client:
+            r = await client.get(FK_BASE + "/", params={"s": q})
+            cards = _fk_cards(r.text)[:5]
+            out["4khdhub"] = {"items": cards, "hint": "Use /fk/stream?path={id}&resolve=true for R2/gpdl CDN"}
+    except Exception as e:
+        out["4khdhub"] = {"error": str(e)}
+    return ok(out, provider="aggregate", level="primary", endpoint="play")
+
+
+# ========== HindiAnime (hindianime.site) ==========
+HA_BASE = "https://www.hindianime.site"
+HA_STREAM = "https://stream.hindianime.site"
+
+async def _ha_get(path: str, params: dict = None):
+    async with _client(35) as client:
+        r = await client.get(
+            urljoin(HA_BASE, path),
+            params=params or {},
+            headers={
+                "User-Agent": UA,
+                "Accept": "application/json,*/*",
+                "Referer": HA_BASE + "/",
+                "Origin": HA_BASE,
+            },
+        )
+        ct = r.headers.get("content-type") or ""
+        if "json" in ct:
+            try:
+                return r.json()
+            except Exception:
+                return {"raw": r.text[:2000]}
+        # sometimes JSON without header
+        t = r.text.strip()
+        if t.startswith("{") or t.startswith("["):
+            try:
+                return json.loads(t)
+            except Exception:
+                pass
+        return {"ok_http": r.status_code, "html": True, "raw": t[:500]}
+
+def _ha_abs_stream(url: Optional[str]) -> Optional[str]:
+    if not url:
+        return None
+    if url.startswith("/api/proxy/") or url.startswith("/api/"):
+        return HA_STREAM + url if url.startswith("/api/proxy/") else HA_BASE + url
+    if url.startswith("/"):
+        return HA_BASE + url
+    return url
+
+def _ha_normalize_servers(servers: list) -> list:
+    out = []
+    for s in servers or []:
+        if not isinstance(s, dict):
+            continue
+        u = s.get("url") or s.get("streamUrl")
+        abs_u = _ha_abs_stream(u)
+        kind = s.get("type") or "unknown"
+        if abs_u and ("get_video" in abs_u or abs_u.endswith(".mp4") or ".mp4?" in abs_u):
+            kind = "mp4"
+        elif abs_u and (".m3u8" in abs_u or "master.m3u8" in abs_u):
+            kind = "hls"
+        elif abs_u and ("streamtape.com/e/" in abs_u or "embed" in abs_u or kind == "iframe"):
+            kind = "iframe"
+        out.append({
+            "name": s.get("name"),
+            "type": kind,
+            "url": abs_u,
+            "audio": s.get("audio"),
+            "langLabel": s.get("langLabel"),
+            "streamtapeId": s.get("streamtapeId"),
+        })
+    return out
+
+@app.get("/ha/catalog", tags=["HindiAnime"])
+async def ha_catalog(kind: str = Query("all", description="all|movies|series")):
+    data = await _ha_get("/api/catalog.json")
+    if not isinstance(data, dict):
+        return fail("catalog failed", provider="hindianime")
+    movies = data.get("movies") or []
+    series = data.get("series") or []
+    if kind == "movies":
+        return ok({"movies": movies, "count": len(movies)}, provider="hindianime", endpoint="catalog")
+    if kind == "series":
+        return ok({"series": series, "count": len(series)}, provider="hindianime", endpoint="catalog")
+    return ok({
+        "totalMovies": data.get("totalMovies"), "totalSeries": data.get("totalSeries"),
+        "movies": movies, "series": series,
+        "count": len(movies) + len(series),
+    }, provider="hindianime", level="live", endpoint="catalog")
+
+@app.get("/ha/home", tags=["HindiAnime"])
+async def ha_home():
+    data = await _ha_get("/api/home-sections")
+    return ok(data, provider="hindianime", level="live", endpoint="home")
+
+@app.get("/ha/hero", tags=["HindiAnime"])
+async def ha_hero():
+    data = await _ha_get("/api/hero.json")
+    return ok(data, provider="hindianime", level="live", endpoint="hero")
+
+@app.get("/ha/sections", tags=["HindiAnime"])
+async def ha_sections():
+    data = await _ha_get("/api/sections.json")
+    return ok(data, provider="hindianime", level="live", endpoint="sections")
+
+@app.get("/ha/spotlights", tags=["HindiAnime"])
+async def ha_spotlights():
+    data = await _ha_get("/api/spotlights.json")
+    return ok(data, provider="hindianime", level="live", endpoint="spotlights")
+
+@app.get("/ha/top10", tags=["HindiAnime"])
+async def ha_top10():
+    data = await _ha_get("/api/top10")
+    return ok(data, provider="hindianime", level="live", endpoint="top10")
+
+@app.get("/ha/browse", tags=["HindiAnime"])
+async def ha_browse():
+    data = await _ha_get("/api/browse-index.json")
+    return ok(data, provider="hindianime", level="live", endpoint="browse")
+
+@app.get("/ha/search", tags=["HindiAnime"])
+async def ha_search(q: str = Query(..., min_length=1)):
+    data = await _ha_get("/api/catalog.json")
+    if not isinstance(data, dict):
+        return fail("catalog failed", provider="hindianime", endpoint="search")
+    ql = q.lower().strip()
+    items = []
+    for bucket, typ in ((data.get("movies") or [], "movie"), (data.get("series") or [], "series")):
+        for a in bucket:
+            hay = f"{a.get('title','')} {a.get('id','')} {' '.join(a.get('genres') or [])}".lower()
+            if ql in hay:
+                items.append({**a, "kind": typ})
+    return ok({"items": items, "count": len(items), "query": q}, provider="hindianime", level="live", endpoint="search")
+
+@app.get("/ha/details", tags=["HindiAnime"])
+async def ha_details(
+    url: Optional[str] = None,
+    id: Optional[str] = None,
+):
+    """Pass url=watchanimeworld link OR id=catalog slug."""
+    if url is not None and not isinstance(url, str):
+        url = None
+    if id is not None and not isinstance(id, str):
+        id = None
+    link = url
+    meta = None
+    if not link and id:
+        cat = await _ha_get("/api/catalog.json")
+        if isinstance(cat, dict):
+            for a in (cat.get("movies") or []) + (cat.get("series") or []):
+                if a.get("id") == id:
+                    link = a.get("link")
+                    meta = a
+                    break
+    if not link:
+        raise HTTPException(400, detail=fail("url or id required", provider="hindianime"))
+    data = await _ha_get("/api/details", {"url": link})
+    if isinstance(data, dict) and meta:
+        data.setdefault("catalog", meta)
+    return ok(data, provider="hindianime", level="live", endpoint="details", link=link)
+
+@app.get("/ha/episodes", tags=["HindiAnime"])
+async def ha_episodes(
+    url: Optional[str] = None,
+    id: Optional[str] = None,
+    season: Optional[int] = None,
+):
+    det = await ha_details(url=url, id=id)
+    data = det.get("data") or {}
+    seasons = data.get("seasons") or {}
+    if season is not None:
+        key = str(season)
+        eps = seasons.get(key) or seasons.get(season) or []
+        return ok({"season": season, "episodes": eps, "count": len(eps)}, provider="hindianime", endpoint="episodes")
+    # flatten
+    flat = []
+    for sk, eps in (seasons.items() if isinstance(seasons, dict) else []):
+        for e in eps or []:
+            flat.append(e)
+    return ok({
+        "title": data.get("title"), "type": data.get("type"),
+        "availableSeasons": data.get("availableSeasons"),
+        "seasons": seasons, "episodes": flat, "count": len(flat),
+    }, provider="hindianime", endpoint="episodes")
+
+@app.get("/ha/stream", tags=["HindiAnime"])
+async def ha_stream(
+    title: Optional[str] = None,
+    url: Optional[str] = None,
+    season: int = 1,
+    episode: int = 1,
+    lang: str = "Hindi",
+    is_movie: bool = False,
+    id: Optional[str] = None,
+):
+    """Resolve direct stream servers (streamtape get_video / HLS proxy / embeds)."""
+    # If id given, pull title + link from catalog/details
+    if id and not title:
+        det = await ha_details(id=id)
+        data = det.get("data") or {}
+        title = data.get("title") or id
+        is_movie = str(data.get("type") or "").upper() == "MOVIE"
+        # pick episode url if series
+        seasons = data.get("seasons") or {}
+        eps = seasons.get(str(season)) or []
+        for e in eps:
+            if int(e.get("episode") or 0) == episode:
+                url = e.get("url") or url
+                break
+    servers = []
+    stream_url = None
+    payload = {}
+    if url:
+        payload = await _ha_get("/api/resolve-stream", {"url": url})
+    if (not payload or not payload.get("success")) and title:
+        payload = await _ha_get("/api/resolve-stream", {
+            "title": title, "season": str(season), "episode": str(episode),
+            "lang": lang, "isMovie": "true" if is_movie else "false",
+        })
+    if isinstance(payload, dict):
+        stream_url = _ha_abs_stream(payload.get("streamUrl"))
+        servers = _ha_normalize_servers(payload.get("servers") or [])
+        if stream_url and not any(s.get("url") == stream_url for s in servers):
+            kind = "hls" if "m3u8" in stream_url else ("mp4" if "get_video" in stream_url or ".mp4" in stream_url else "link")
+            servers.insert(0, {"name": payload.get("server") or "Primary", "type": kind, "url": stream_url})
+        # also absolute embed
+        if payload.get("embedUrl"):
+            servers.append({"name": "Embed", "type": "iframe", "url": payload.get("embedUrl")})
+    # classify direct CDN
+    direct = [s for s in servers if s.get("type") in ("mp4", "hls") and s.get("url")]
+    return ok({
+        "title": title, "season": season, "episode": episode, "lang": lang,
+        "streamUrl": stream_url,
+        "servers": servers, "direct": direct, "direct_count": len(direct),
+        "raw": {k: payload.get(k) for k in ("success", "videoHash", "server") if isinstance(payload, dict)},
+    }, provider="hindianime", level="live", endpoint="stream",
+       note="Prefer servers type=mp4 (streamtape get_video) or type=hls. Embeds need browser.")
+
+@app.get("/ha/trailer", tags=["HindiAnime"])
+async def ha_trailer(title: str = Query(...)):
+    data = await _ha_get("/api/find-trailer", {"title": title})
+    return ok(data, provider="hindianime", level="live", endpoint="trailer")
+
+@app.get("/ha/proxy", tags=["HindiAnime"])
+async def ha_proxy(hash: str = Query(..., description="videoHash from resolve-stream")):
+    """Absolute HLS proxy URL for p2p-master (may be offline upstream)."""
+    urls = [
+        f"{HA_STREAM}/api/proxy/p2p-master.m3u8?hash={hash}",
+        f"{HA_BASE}/api/proxy/p2p-master.m3u8?hash={hash}",
+        f"{HA_STREAM}/api/proxy/master.m3u8?hash={hash}",
+    ]
+    return ok({"hash": hash, "hls_urls": urls}, provider="hindianime", endpoint="proxy")
+
+
 @app.get("/search", tags=["Aggregate"])
 async def aggregate_search(q: str = Query(..., min_length=1)):
     results = {}
@@ -949,7 +1348,7 @@ async def aggregate_search(q: str = Query(..., min_length=1)):
 
 @app.get("/health", tags=["Meta"])
 async def health():
-    return ok({"version": VERSION, "providers": ["moviebox", "4khdhub", "hubcloud", "dramachi", "iptv", "hentaicity"]})
+    return ok({"version": VERSION, "providers": ["moviebox", "4khdhub", "hubcloud", "dramachi", "iptv", "hentaicity", "hindianime", "tools", "aggregate"]})
 
 # ========== DOCS UI (mobile-first) ==========
 DOCS_HTML = """<!DOCTYPE html>
@@ -1002,7 +1401,7 @@ footer{text-align:center;color:var(--mu);font-size:12px;padding:20px 0 10px}
 </head>
 <body>
 <header class="top">
-  <div class="brand"><div class="logo">SH</div><div><h1>StreamHub API</h1><small>v7.5.0 · creator: shawon</small></div></div>
+  <div class="brand"><div class="logo">SH</div><div><h1>StreamHub API</h1><small>v7.7.0 · creator: shawon</small></div></div>
   <div class="search"><span style="opacity:.4;font-size:13px">⌕</span><input id="q" placeholder="Filter endpoints…" oninput="filt()"/></div>
 </header>
 <div class="tabs" id="tabs"></div>
@@ -1020,7 +1419,13 @@ const E = [
 {g:'MovieBox',p:'/mb/adult',how:'18+ search. Genre filtered Adult/Erotic. Default q=sex.',params:[{n:'q',v:'sex'},{n:'page',v:'1'}]},
 {g:'MovieBox',p:'/mb/adult/home',how:'Curated adult home (tabId=9 — Porn Top Videos shelves).',params:[{n:'page',v:'1'}]},
 {n:'page',v:'1'}]},
-{g:'MovieBox',p:'/mb/play/{id}',how:'Returns MP4 + DASH. For DASH send the <code>cookie</code> header. Series: add se & ep.',params:[{n:'id',v:'1654274595068805784',path:true},{n:'se',v:''},{n:'ep',v:''}]},
+{g:'MovieBox',p:'/mb/play/{id}',how:'Returns MP4 + DASH. For DASH send the <code>cookie</code> header. Series: add se & ep.',params:[{n:'id',v:'1654274595068805784',path:true},
+{g:'MovieBox',p:'/mb/cdn/{id}',how:'All MP4 + DASH CDN for a subjectId (play + resource).',params:[{n:'id',v:'1654274595068805784',path:true}]},
+{g:'MovieBox',p:'/mb/mp4/{id}',how:'Only direct MP4 CDN URL list.',params:[{n:'id',v:'1654274595068805784',path:true}]},
+{g:'Tools',p:'/tools/mp4',how:'Extract every MP4/MKV/M3U8/CDN from a page or mirror URL.',params:[{n:'url',v:'https://hubcloud.ist/drive/1qg90m0nr2599rq'}]},
+{g:'Tools',p:'/tools/cdn-types',how:'Known CDN host patterns.',params:[]},
+{g:'Aggregate',p:'/play',how:'Search + MovieBox full CDN + 4K paths in one call.',params:[{n:'q',v:'avatar'}]},
+{n:'se',v:''},{n:'ep',v:''}]},
 {g:'MovieBox',p:'/mb/detail/{id}',how:'Full metadata for a subjectId.',params:[{n:'id',v:'1654274595068805784',path:true}]},
 {g:'MovieBox',p:'/mb/resource/{id}',how:'Extra resource/download links.',params:[{n:'id',v:'1654274595068805784',path:true}]},
 {g:'MovieBox',p:'/mb/seasons/{id}',how:'Season list for series.',params:[{n:'id',v:'1654274595068805784',path:true}]},
@@ -1042,6 +1447,17 @@ const E = [
 {g:'HentaiCity',p:'/hc/popular',how:'Popular list (same shape as recent).',params:[]},
 {g:'HentaiCity',p:'/hc/search',how:'Search. On block falls back to seed CDN items.',params:[{n:'q',v:'anime'}]},
 {g:'HentaiCity',p:'/hc/watch',how:'Best: pass folder + vid from list item. Builds all qualities.',params:[{n:'folder',v:'0267'},{n:'vid',v:'38191'}]},
+{g:'HindiAnime',p:'/ha/catalog',how:'Full movies+series catalog from hindianime.site',params:[{n:'kind',v:'all'}]},
+{g:'HindiAnime',p:'/ha/home',how:'Home sections: topAiring, popular, latest…',params:[]},
+{g:'HindiAnime',p:'/ha/search',how:'Search catalog by title/genre.',params:[{n:'q',v:'naruto'}]},
+{g:'HindiAnime',p:'/ha/details',how:'Episodes + servers. Pass id=slug or url=watchanimeworld link.',params:[{n:'id',v:'clevatess'}]},
+{g:'HindiAnime',p:'/ha/episodes',how:'Episode list for a title.',params:[{n:'id',v:'clevatess'},{n:'season',v:'1'}]},
+{g:'HindiAnime',p:'/ha/stream',how:'Direct stream servers (mp4 get_video / hls / iframe).',params:[{n:'id',v:'clevatess'},{n:'season',v:'1'},{n:'episode',v:'1'},{n:'lang',v:'Hindi'}]},
+{g:'HindiAnime',p:'/ha/hero',how:'Hero carousel JSON',params:[]},
+{g:'HindiAnime',p:'/ha/top10',how:'Trending + popular',params:[]},
+{g:'HindiAnime',p:'/ha/spotlights',how:'Spotlight rotation',params:[]},
+{g:'HindiAnime',p:'/ha/trailer',how:'YouTube trailer lookup',params:[{n:'title',v:'naruto'}]},
+{g:'HindiAnime',p:'/ha/proxy',how:'Build HLS proxy URLs from videoHash',params:[{n:'hash',v:'kqdr8'}]},
 {g:'HentaiCity',p:'/hc/cdn',how:'No scrape. Always builds HLS + MP4 links from folder+vid.',params:[{n:'folder',v:'0267'},{n:'vid',v:'38191'}]},
 {g:'Aggregate',p:'/search',how:'MovieBox + 4K + Dramachi in one response.',params:[{n:'q',v:'batman'}]},
 {g:'Meta',p:'/health',how:'Version and provider list.',params:[]},
