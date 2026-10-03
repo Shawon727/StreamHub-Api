@@ -1,4 +1,4 @@
-# StreamHub API v8.1.1 — creator: shawon
+# StreamHub API v8.1.2 — creator: shawon
 from __future__ import annotations
 
 import asyncio, base64, hashlib, hmac, json, random, re, time, uuid
@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
-CREATOR, VERSION = "shawon", "8.1.1"
+CREATOR, VERSION = "shawon", "8.1.2"
 app = FastAPI(title="StreamHub API", version=VERSION, docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -1904,15 +1904,115 @@ async def kt_suggestions_episode(episode_id: str):
     return _kt_wrap(st, data, "suggestions_episode", "challenge")
 
 # ---- Auth required (pass ?auth=TOKEN or Authorization header via auth query) ----
+def _kt_extract_session(data: Any) -> dict:
+    """Normalize login/device-link response → token + user JSON."""
+    if not isinstance(data, dict):
+        return {"raw": data}
+    root = data.get("data") if isinstance(data.get("data"), dict) else data
+    token = (
+        root.get("token") or root.get("access_token") or root.get("accessToken")
+        or root.get("jwt") or root.get("authToken") or data.get("token")
+    )
+    user = root.get("user") or root.get("account") or root.get("profile") or root.get("me")
+    # sometimes user fields flat
+    if not user and root.get("username"):
+        user = {k: root.get(k) for k in ("_id", "id", "username", "email", "avatar", "role", "badges") if root.get(k) is not None}
+    out = {
+        "token": token,
+        "user": user,
+        "refresh_token": root.get("refresh_token") or root.get("refreshToken"),
+        "expires_in": root.get("expires_in") or root.get("expiresIn"),
+        "token_type": root.get("token_type") or ("Bearer" if token else None),
+    }
+    # keep useful extras
+    for k in ("stremio", "settings", "subscription", "message", "success"):
+        if k in root:
+            out[k] = root[k]
+    out["raw"] = data
+    return out
+
 @app.get("/kt/auth/me", tags=["Kartoons-Auth"])
 async def kt_auth_me(auth: str = Query(..., description="JWT / Bearer token from kartoons login")):
     st, data = await _kt_req("GET", "/auth/me", auth=auth)
+    if st < 400 and isinstance(data, dict):
+        sess = _kt_extract_session(data)
+        # merge me payload
+        me = data.get("data") if isinstance(data.get("data"), dict) else data
+        return ok({
+            "token": auth.replace("Bearer ", "").replace("bearer ", "").strip(),
+            "user": me if isinstance(me, dict) else sess.get("user"),
+            "session": sess,
+            "raw": data,
+        }, provider="kartoons", endpoint="auth_me", access="auth")
     return _kt_wrap(st, data, "auth_me", "auth")
 
-@app.post("/kt/auth/login", tags=["Kartoons-Auth"])
-async def kt_auth_login(email: str = Query(...), password: str = Query(...)):
-    st, data = await _kt_req("POST", "/auth/login", json_body={"email": email, "password": password})
-    return _kt_wrap(st, data, "auth_login", "auth", how="Save returned token; pass as auth= to other /kt/auth and /kt/user routes")
+async def _kt_do_login(username: str, password: str, turnstile_token: Optional[str] = None):
+    """Upstream expects username + password; CAPTCHA often required."""
+    body = {"username": username, "password": password}
+    if turnstile_token:
+        body["turnstile_token"] = turnstile_token
+        body["cf-turnstile-response"] = turnstile_token
+    st, data = await _kt_req("POST", "/auth/login", json_body=body)
+    # fallback email field if username rejected
+    if st >= 400 and isinstance(data, dict) and "username" in str(data.get("message") or "").lower():
+        st, data = await _kt_req("POST", "/auth/login", json_body={
+            "email": username, "password": password,
+            **({"turnstile_token": turnstile_token} if turnstile_token else {}),
+        })
+    sess = _kt_extract_session(data if isinstance(data, dict) else {})
+    if st < 400 and sess.get("token"):
+        # enrich with /auth/me when possible
+        st2, me = await _kt_req("GET", "/auth/me", auth=sess["token"])
+        if st2 < 400:
+            sess["user"] = (me.get("data") if isinstance(me, dict) and isinstance(me.get("data"), dict) else me) or sess.get("user")
+            sess["me_raw"] = me
+        return ok({
+            "logged_in": True,
+            "token": sess.get("token"),
+            "user": sess.get("user"),
+            "refresh_token": sess.get("refresh_token"),
+            "expires_in": sess.get("expires_in"),
+            "token_type": sess.get("token_type") or "Bearer",
+            "how": "Use token with ?auth=TOKEN on /kt/user/*, /kt/watchlist, /kt/stremio/stream, /kt/auth/me",
+            "raw": data,
+        }, provider="kartoons", endpoint="auth_login", access="auth")
+    # captcha / error
+    msg = (data.get("message") if isinstance(data, dict) else None) or f"HTTP {st}"
+    challenge = "captcha" in str(msg).lower() or "turnstile" in str(msg).lower()
+    return fail(
+        str(msg),
+        provider="kartoons", endpoint="auth_login", access="auth", status=st,
+        captcha_required=challenge,
+        how=(
+            "Kartoons login needs Cloudflare Turnstile. Options: "
+            "1) Pass turnstile_token from browser on kartoons.to login page. "
+            "2) Use device link (no password on API): GET /kt/device/code → open link_url → enter code → GET /kt/device/status?code= until token JSON appears."
+        ),
+        data=data,
+        session_attempt=sess,
+    )
+
+@app.api_route("/kt/auth/login", methods=["GET", "POST"], tags=["Kartoons-Auth"])
+async def kt_auth_login(
+    username: Optional[str] = Query(None, description="Kartoons username or email"),
+    password: Optional[str] = Query(None),
+    email: Optional[str] = Query(None, description="Alias for username"),
+    turnstile_token: Optional[str] = Query(None, description="Cloudflare Turnstile token from browser"),
+):
+    """
+    Login → full JSON with token + user.
+    Docs Try-it uses GET (supported). Upstream often requires turnstile_token.
+    Prefer /kt/device/code flow if captcha blocks password login.
+    """
+    user = (username or email or "").strip()
+    pw = (password or "").strip()
+    if not user or not pw:
+        return fail(
+            "username (or email) and password required",
+            provider="kartoons", endpoint="auth_login",
+            how="Example: /kt/auth/login?username=YOU&password=PASS&turnstile_token=...",
+        )
+    return await _kt_do_login(user, pw, turnstile_token)
 
 @app.get("/kt/user/me", tags=["Kartoons-Auth"])
 async def kt_user_me(auth: str = Query(...)):
@@ -1950,7 +2050,7 @@ async def kt_stremio_status(auth: str = Query(...)):
     return _kt_wrap(st, data, "stremio_status", "auth")
 
 
-@app.post("/kt/device/code", tags=["Kartoons-Public"])
+@app.api_route("/kt/device/code", methods=["GET", "POST"], tags=["Kartoons-Public"])
 async def kt_device_code():
     """Start TV/device link flow. User opens link_url and enters code — then poll /kt/device/status."""
     st, data = await _kt_req("POST", "/app/device/code", json_body={})
@@ -1961,8 +2061,34 @@ async def kt_device_code():
 
 @app.get("/kt/device/status", tags=["Kartoons-Public"])
 async def kt_device_status(code: str, fullinfo: bool = True):
+    """Poll after /kt/device/code. When user links device on site, response includes token — normalized below."""
     st, data = await _kt_req("GET", "/app/device/status", {"code": code, "fullinfo": str(fullinfo).lower()})
-    return _kt_wrap(st, data, "device_status", "public")
+    sess = _kt_extract_session(data if isinstance(data, dict) else {})
+    status = None
+    if isinstance(data, dict):
+        status = data.get("status") or (data.get("data") or {}).get("status") if isinstance(data.get("data"), dict) else data.get("status")
+    if sess.get("token"):
+        st2, me = await _kt_req("GET", "/auth/me", auth=sess["token"])
+        if st2 < 400:
+            sess["user"] = (me.get("data") if isinstance(me, dict) and isinstance(me.get("data"), dict) else me) or sess.get("user")
+        return ok({
+            "linked": True,
+            "status": status or "linked",
+            "token": sess.get("token"),
+            "user": sess.get("user"),
+            "refresh_token": sess.get("refresh_token"),
+            "token_type": "Bearer",
+            "how": "Save token. Call /kt/auth/me?auth=TOKEN or /kt/user/me?auth=TOKEN",
+            "raw": data,
+        }, provider="kartoons", endpoint="device_status", access="public")
+    return ok({
+        "linked": False,
+        "status": status or (data.get("status") if isinstance(data, dict) else None),
+        "token": None,
+        "message": (data.get("message") if isinstance(data, dict) else None) or "Waiting for device link",
+        "how": "Open link_url from /kt/device/code on phone, enter code, then refresh this endpoint",
+        "raw": data,
+    }, provider="kartoons", endpoint="device_status", access="public", http_upstream=st)
 
 @app.get("/kt/stremio/stream", tags=["Kartoons-Auth"])
 async def kt_stremio_stream(
@@ -2201,7 +2327,7 @@ footer{text-align:center;color:var(--mu);font-size:12px;padding:20px 0 10px}
 </head>
 <body>
 <header class="top">
-  <div class="brand"><div class="logo">SH</div><div><h1>StreamHub API</h1><small>v7.8.0 · creator: shawon</small></div></div>
+  <div class="brand"><div class="logo">SH</div><div><h1>StreamHub API</h1><small>v8.1.2 · creator: shawon</small></div></div>
   <div class="search"><span style="opacity:.4;font-size:13px">⌕</span><input id="q" placeholder="Filter endpoints…" oninput="filt()"/></div>
 </header>
 <div class="tabs" id="tabs"></div>
@@ -2285,7 +2411,7 @@ const E = [
 {g:'Kartoons',p:'/kt/community/posts',how:'CHALLENGE: community posts.',params:[]},
 {g:'Kartoons',p:'/kt/collections',how:'CHALLENGE: collections list.',params:[]},
 {g:'Kartoons',p:'/kt/suggestions/episode/{episode_id}',how:'CHALLENGE: related episode suggestions.',params:[{n:'episode_id',v:'6867877f57ee07b9b7401910',path:true}]},
-{g:'Kartoons',p:'/kt/auth/login',how:'AUTH: login → save token. Then pass auth=TOKEN on user routes. (POST — Try it may need fetch POST)',params:[{n:'email',v:''},{n:'password',v:''}]},
+{g:'Kartoons',p:'/kt/auth/login',how:'AUTH login (GET+POST). Returns token+user JSON. Upstream often needs turnstile_token. No captcha? Use /kt/device/code instead.',params:[{n:'username',v:''},{n:'password',v:''},{n:'turnstile_token',v:''}]},
 {g:'Kartoons',p:'/kt/auth/me',how:'AUTH: current user. Requires auth= token.',params:[{n:'auth',v:''}]},
 {g:'Kartoons',p:'/kt/user/me',how:'AUTH: user profile.',params:[{n:'auth',v:''}]},
 {g:'Kartoons',p:'/kt/user/continue-watching',how:'AUTH: continue watching list.',params:[{n:'auth',v:''}]},
@@ -2324,7 +2450,7 @@ function render(){
     if(e.g!==last){html+=`<div class="sec">${e.g}</div>`;last=e.g}
     const fields=(e.params||[]).map(pr=>`<div class="field"><label>${pr.n}${pr.path?' (path)':''}</label><input id="f${i}_${pr.n}" value="${(pr.v||'').replace(/"/g,'&quot;')}"/></div>`).join('');
     html+=`<div class="ep" id="ep${i}">
-      <div class="ep-h" onclick="tog(${i})"><span class="m">GET</span><span class="p">${e.p}</span><span class="arrow">›</span></div>
+      <div class="ep-h" onclick="tog(${i})"><span class="m">${e.method||'GET'}</span><span class="p">${e.p}</span><span class="arrow">›</span></div>
       <div class="ep-b">
         <div class="how">${e.how}</div>
         <div class="fields">${fields}</div>
@@ -2344,15 +2470,16 @@ function tog(i){const el=document.getElementById('ep'+i);const o=el.classList.co
   document.querySelectorAll('.ep').forEach(e=>e.classList.remove('open')); if(!o) el.classList.add('open')}
 function copyUrl(i){navigator.clipboard.writeText(buildUrl(E[i],i))}
 async function run(i){
-  const u=buildUrl(E[i],i); const out=document.getElementById('o'+i); const st=document.getElementById('st'+i);
+  const e=E[i]; const u=buildUrl(e,i); const out=document.getElementById('o'+i); const st=document.getElementById('st'+i);
   out.textContent='Loading…'; st.textContent='';
   const t0=performance.now();
   try{
-    const r=await fetch(u); const t=await r.text();
+    const method=(e.method||'GET').toUpperCase();
+    const r=await fetch(u,{method}); const t=await r.text();
     let p=t; try{p=JSON.stringify(JSON.parse(t),null,2)}catch(_){}
     st.textContent=r.status+' · '+Math.round(performance.now()-t0)+' ms';
     out.textContent=p.slice(0,16000);
-  }catch(e){st.textContent='error'; out.textContent=String(e)}
+  }catch(err){st.textContent='error'; out.textContent=String(err)}
 }
 render();
 </script>
