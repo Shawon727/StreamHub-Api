@@ -1,4 +1,4 @@
-# StreamHub API v8.2.4 — creator: shawon
+# StreamHub API v8.2.6 — creator: shawon
 from __future__ import annotations
 
 import asyncio, base64, gzip, hashlib, hmac, json, random, re, time, uuid
@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response, StreamingResponse, PlainTextResponse
 
-CREATOR, VERSION = "shawon", "8.2.4"
+CREATOR, VERSION = "shawon", "8.2.6"
 app = FastAPI(title="StreamHub API", version=VERSION, docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -3251,7 +3251,7 @@ footer{text-align:center;color:var(--mu);font-size:12px;padding:20px 0 10px}
 </head>
 <body>
 <header class="top">
-  <div class="brand"><div class="logo">SH</div><div><h1>StreamHub API</h1><small>v8.2.4 · creator: shawon</small></div></div>
+  <div class="brand"><div class="logo">SH</div><div><h1>StreamHub API</h1><small>v8.2.6 · creator: shawon</small></div></div>
   <div class="search"><span style="opacity:.4;font-size:13px">⌕</span><input id="q" placeholder="Filter endpoints…" oninput="filt()"/></div>
 </header>
 <div class="tabs" id="tabs"></div>
@@ -3291,20 +3291,18 @@ const E = [
 {g:'Dramachi',p:'/dr/detail',how:'Metadata only (no public stream CDN).',params:[{n:'id',v:'524'},{n:'content',v:'movies'}]},
 {g:'Dramachi',p:'/dr/thumb',how:'Poster by thumb filename.',params:[{n:'name',v:'godlovescaviar2012h.jpg'}]},
 {g:'IPTV',p:'/iptv/channels',how:'Live M3U. source 0=global 1=BD 2=IN.',params:[{n:'source',v:'0'},{n:'limit',v:'30'},{n:'q',v:''}]},
-{g:'HentaiCity',p:'/hc/home',how:'Recent+popular+cartoon. pages=2 merges 2 list pages each.',params:[{n:'pages',v:'2'}]},
-{g:'HentaiCity',p:'/hc/recent',how:'Paginated recent. page=1..140, pages=N merges N pages (~34 each).',params:[{n:'page',v:'1'},{n:'pages',v:'2'}]},
-{g:'HentaiCity',p:'/hc/popular',how:'Paginated popular. Same page system.',params:[{n:'page',v:'1'},{n:'pages',v:'2'}]},
+{g:'HentaiCity',p:'/hc/home',how:'Recent+popular+cartoon. pages merges list pages.',params:[{n:'pages',v:'2'}]},
+{g:'HentaiCity',p:'/hc/recent',how:'Paginated recent. page=1..140, pages=N merges N pages.',params:[{n:'page',v:'1'},{n:'pages',v:'2'}]},
+{g:'HentaiCity',p:'/hc/popular',how:'Paginated popular.',params:[{n:'page',v:'1'},{n:'pages',v:'2'}]},
 {g:'HentaiCity',p:'/hc/feed',how:'Infinite-scroll feed. mix=recent|popular|both.',params:[{n:'page',v:'1'},{n:'pages',v:'3'},{n:'mix',v:'recent'}]},
-{g:'HentaiCity',p:'/hc/search',how:'Official search. Returns items + suggestions titles.',params:[{n:'q',v:'school'}]},
-{g:'HentaiCity',p:'/hc/suggest',how:'Typeahead: title/folder/poster suggestions while typing.',params:[{n:'q',v:'tea'}]},
-{g:'HentaiCity',p:'/hc/recommend',how:'Recommended mix (popular+category). Pass folder+vid to exclude current.',params:[{n:'tag',v:'cartoon'},{n:'limit',v:'24'}]},
-{g:'HentaiCity',p:'/hc/category',how:'Category list. tag=cartoon|3d|bigtits…',params:[{n:'tag',v:'cartoon'},{n:'sort',v:'popular'},{n:'page',v:'1'}]},
+{g:'HentaiCity',p:'/hc/search',how:'Official search + suggestion titles.',params:[{n:'q',v:'school'}]},
+{g:'HentaiCity',p:'/hc/suggest',how:'Typeahead suggestions while typing.',params:[{n:'q',v:'tea'}]},
+{g:'HentaiCity',p:'/hc/recommend',how:'Recommended mix. Optional folder+vid to exclude current.',params:[{n:'tag',v:'cartoon'},{n:'limit',v:'24'}]},
+{g:'HentaiCity',p:'/hc/category',how:'Category. tag=cartoon|3d|bigtits…',params:[{n:'tag',v:'cartoon'},{n:'sort',v:'popular'},{n:'page',v:'1'}]},
 {g:'HentaiCity',p:'/hc/categories',how:'All category tags.',params:[]},
-{g:'HentaiCity',p:'/hc/watch',how:'Streams + recommend[]. CDN poster/trailer.',params:[{n:'folder',v:'0498'},{n:'vid',v:'38179'}]},
+{g:'HentaiCity',p:'/hc/watch',how:'Streams + recommend. folder+vid required.',params:[{n:'folder',v:'0498'},{n:'vid',v:'38179'}]},
 {g:'HentaiCity',p:'/hc/streams',how:'Flat sources for quality UI.',params:[{n:'folder',v:'0498'},{n:'vid',v:'38179'}]},
-{g:'HentaiCity',p:'/hc/cdn',how:'Raw CDN map.',params:[{n:'folder',v:'0498'},{n:'vid',v:'38179'}]},
-{n:'vid',v:'38191'}]},
-{g:'HentaiCity',p:'/hc/cdn',how:'Always builds HLS+MP4 from folder+vid.',params:[{n:'folder',v:'0267'},{n:'vid',v:'38191'}]},
+{g:'HentaiCity',p:'/hc/cdn',how:'Raw CDN map HLS+MP4.',params:[{n:'folder',v:'0498'},{n:'vid',v:'38179'}]},
 {g:'HindiAnime',p:'/ha/catalog',how:'Full movies+series catalog (hindianime.site).',params:[{n:'kind',v:'all'}]},
 {g:'HindiAnime',p:'/ha/home',how:'Home: topAiring, popular, latest…',params:[]},
 {g:'HindiAnime',p:'/ha/search',how:'Search catalog by title/genre.',params:[{n:'q',v:'naruto'}]},
@@ -5283,7 +5281,7 @@ function pgHentaiCity(){
   load(true);
 }
 
-function hcSourcesfunction hcSources(streams){
+function hcSources(streams){
   if(!streams)return[];
   const out=[];
   const mp4=streams.mp4||{};
