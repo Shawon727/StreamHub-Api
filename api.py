@@ -1,4 +1,4 @@
-# StreamHub API v8.2.2 — creator: shawon
+# StreamHub API v8.2.3 — creator: shawon
 from __future__ import annotations
 
 import asyncio, base64, gzip, hashlib, hmac, json, random, re, time, uuid
@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response, StreamingResponse, PlainTextResponse
 
-CREATOR, VERSION = "shawon", "8.2.2"
+CREATOR, VERSION = "shawon", "8.2.3"
 app = FastAPI(title="StreamHub API", version=VERSION, docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -1100,7 +1100,8 @@ async def iptv_channels(source: int = 0, q: Optional[str] = None, limit: int = 5
 
 # ========== HentaiCity ==========
 HC_BASE = "https://www.hentaicity.com"
-# Fallback when datacenter IP is geo/privacy blocked — real folder/vid + real titles
+HC_MAX_PAGE = 140  # site has all-recent-1 … all-recent-140
+
 _HC_SEED = [
     {"folder": "0498", "vid": "38179", "id": "fuck-the-spire", "title": "Fuck the Spire - JOI game play"},
     {"folder": "0626", "vid": "38136", "id": "weak-teacher-2", "title": "Weak Teacher 2 (ecchi anime)"},
@@ -1119,7 +1120,7 @@ def _hc_cdn(folder: str, vid: str) -> dict:
         f",default,mobile,480p,720p,1080p,.mp4.urlset/master.m3u8"
     )
     return {
-        "folder": folder, "video_id": vid, "hls": hls,
+        "folder": folder, "video_id": str(vid), "hls": hls,
         "mp4": {
             "mobile": f"{base_flv}/mobile.mp4",
             "default": f"{base_flv}/default.mp4",
@@ -1129,23 +1130,33 @@ def _hc_cdn(folder: str, vid: str) -> dict:
         },
         "poster": f"https://cdn1.images.hentaicity.com/videos/{folder}/{vid}/main.jpg",
         "poster_hd": f"https://cdn1.images.hentaicity.com/videos/{folder}/{vid}/1080p.jpg",
+        "thumb": f"https://cdn1.images.hentaicity.com/videos/{folder}/{vid}/main.jpg",
         "trailer": f"https://cdn1.hentaicity.com/{folder}/{vid}/trailer.mp4",
-        "page": f"{HC_BASE}/video/",
     }
+
+def _hc_abs_img(src: Optional[str]) -> Optional[str]:
+    if not src:
+        return None
+    s = src.strip()
+    if s.startswith("data:"):
+        return None
+    if s.startswith("//"):
+        s = "https:" + s
+    if s.startswith("/"):
+        s = HC_BASE + s
+    return s
 
 def _hc_clean_title(title: str, fallback: str) -> str:
     t = " ".join((title or "").split()).strip()
-    junk = {"view", "play", "watch", "video", "more", "hd"}
-    if not t or t.lower() in junk or (len(t) <= 2):
+    junk = {"view", "play", "watch", "video", "more", "hd", "new"}
+    if not t or t.lower() in junk or len(t) <= 2:
         t = fallback.replace("-", " ")
-    # strip trailing site noise
     t = re.sub(r"\s*\|\s*HentaiCity.*$", "", t, flags=re.I)
     return t[:160]
 
 def _hc_list(html: str) -> list:
-    soup = BeautifulSoup(html, "html.parser")
-    items = []
-    seen = set()
+    soup = BeautifulSoup(html or "", "html.parser")
+    items, seen = [], set()
     for a in soup.select("a[href*='/video/']"):
         href = a.get("href") or ""
         m = re.search(r"/video/([^/?#]+\.html)", href)
@@ -1161,14 +1172,16 @@ def _hc_list(html: str) -> list:
             img = a.parent.find("img")
         poster = folder = vid_num = None
         if img:
-            poster = (
+            poster = _hc_abs_img(
                 img.get("data-src")
                 or img.get("data-original")
                 or img.get("data-lazy-src")
+                or img.get("data-srcset")
                 or img.get("src")
             )
-            if poster and poster.startswith("//"):
-                poster = "https:" + poster
+            # srcset first url
+            if poster and " " in poster and "," in (img.get("data-srcset") or ""):
+                poster = _hc_abs_img(poster.split(",")[0].strip().split(" ")[0])
             if poster:
                 fm = re.search(r"/videos/(\d+)/(\d+)/", poster)
                 if fm:
@@ -1180,54 +1193,61 @@ def _hc_list(html: str) -> list:
             title = " ".join(a.get_text().split())
         title = _hc_clean_title(title, vid_key)
         full = href if href.startswith("http") else urljoin(HC_BASE, href)
+        # Prefer deterministic CDN poster when folder/vid known (always works)
+        streams = None
+        if folder and vid_num:
+            streams = _hc_cdn(folder, vid_num)
+            poster = streams["poster"]
         item = {
             "id": vid_key,
             "slug": slug,
             "title": title,
             "url": full,
             "poster": poster,
+            "thumbnail": poster,
             "folder": folder,
             "numeric_id": vid_num,
+            "trailer": streams["trailer"] if streams else None,
+            "streams": streams,
         }
-        if folder and vid_num:
-            item["streams"] = _hc_cdn(folder, vid_num)
-            item["trailer"] = item["streams"]["trailer"]
         items.append(item)
     return items
 
-def _hc_seed_items():
+def _hc_seed_items() -> list:
     out = []
     for s in _HC_SEED:
         streams = _hc_cdn(s["folder"], s["vid"])
         out.append({
-            "id": s["id"],
-            "title": s["title"],
-            "folder": s["folder"],
-            "numeric_id": s["vid"],
-            "poster": streams["poster"],
-            "trailer": streams["trailer"],
-            "streams": streams,
-            "seed": True,
-            "url": f"{HC_BASE}/video/{s['id']}.html",
+            "id": s["id"], "title": s["title"], "folder": s["folder"], "numeric_id": s["vid"],
+            "poster": streams["poster"], "thumbnail": streams["poster"], "trailer": streams["trailer"],
+            "streams": streams, "seed": True, "url": f"{HC_BASE}/video/{s['id']}.html",
         })
     return out
 
+def _hc_page_path(kind: str, page: int, tag: Optional[str] = None) -> str:
+    """Build list URL. kind=recent|popular|category. page starts at 1."""
+    page = max(1, min(int(page or 1), HC_MAX_PAGE))
+    if kind == "popular":
+        base = "all-popular"
+    elif kind == "category" and tag:
+        tag = re.sub(r"[^a-z0-9]", "", tag.lower()) or "cartoon"
+        # sort embedded in tag path later
+        base = tag
+    else:
+        base = "all-recent"
+    if kind == "category" and tag:
+        # caller passes full like cartoon-popular
+        if page <= 1:
+            return f"/videos/straight/{tag}.html"
+        return f"/videos/straight/{tag}-{page}.html"
+    if page <= 1:
+        return f"/videos/straight/{base}.html"
+    return f"/videos/straight/{base}-{page}.html"
+
 async def _hc_get(path: str, params: dict = None) -> tuple:
-    """Fetch HTML. Returns (text|None, blocked: bool)."""
     headers_list = [
-        {
-            "User-Agent": UA,
-            "Referer": HC_BASE + "/",
-            "Accept": "text/html,application/xhtml+xml",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Cache-Control": "no-cache",
-        },
-        {
-            "User-Agent": MOBILE_UA,
-            "Referer": "https://www.google.com/",
-            "Accept": "text/html",
-            "Accept-Language": "en-US,en;q=0.9",
-        },
+        {"User-Agent": UA, "Referer": HC_BASE + "/", "Accept": "text/html,application/xhtml+xml", "Accept-Language": "en-US,en;q=0.9"},
+        {"User-Agent": MOBILE_UA, "Referer": "https://www.google.com/", "Accept": "text/html"},
     ]
     async with _client(28.0) as client:
         for headers in headers_list:
@@ -1236,9 +1256,7 @@ async def _hc_get(path: str, params: dict = None) -> tuple:
                 text = r.text or ""
                 if "defendonlineprivacy" in str(r.url) or "defendonlineprivacy" in text[:1200]:
                     continue
-                if r.status_code >= 400 and r.status_code != 404:
-                    continue
-                if len(text) < 500:
+                if len(text) < 400:
                     continue
                 return text, False
             except Exception:
@@ -1248,139 +1266,211 @@ async def _hc_get(path: str, params: dict = None) -> tuple:
 async def _hc_fetch_list(path: str) -> tuple:
     text, blocked = await _hc_get(path)
     if text:
-        items = _hc_list(text)
-        # only keep items with folder+vid when possible; else keep all
-        with_cdn = [i for i in items if i.get("folder") and i.get("numeric_id")]
-        use = with_cdn or items
-        if use:
-            return use, False, "live"
-    return _hc_seed_items(), True, (
-        "HentaiCity HTML blocked or empty on this server IP. "
-        "Showing curated seed with real CDN paths. Deploy on residential IP for full catalog."
-    )
+        items = [i for i in _hc_list(text) if i.get("folder") and i.get("numeric_id")]
+        if not items:
+            items = _hc_list(text)
+        if items:
+            return items, False, "live", path
+    return _hc_seed_items(), True, "blocked_or_empty_seed", path
+
+async def _hc_fetch_pages(kind: str, page: int, pages: int = 1, tag: Optional[str] = None) -> tuple:
+    """Fetch one or more consecutive pages and merge unique items."""
+    pages = max(1, min(int(pages or 1), 10))
+    page = max(1, int(page or 1))
+    all_items, seen = [], set()
+    blocked_any, note = False, "live"
+    last_path = ""
+    for i in range(pages):
+        pnum = page + i
+        if pnum > HC_MAX_PAGE:
+            break
+        if kind == "category" and tag:
+            path = _hc_page_path("category", pnum, tag)
+        else:
+            path = _hc_page_path(kind, pnum)
+        last_path = path
+        items, blocked, n, _ = await _hc_fetch_list(path)
+        blocked_any = blocked_any or blocked
+        if blocked:
+            note = n
+        for it in items:
+            k = (it.get("folder"), it.get("numeric_id") or it.get("id"))
+            if k in seen:
+                continue
+            seen.add(k)
+            it["page"] = pnum
+            all_items.append(it)
+    has_more = (page + pages - 1) < HC_MAX_PAGE and not blocked_any
+    return all_items, blocked_any, note, last_path, has_more
 
 @app.get("/hc/home", tags=["HentaiCity"])
-async def hc_home():
-    """Homepage shelves: recent + popular."""
-    recent, br, nr = await _hc_fetch_list("/videos/straight/all-recent.html")
-    popular, bp, np_ = await _hc_fetch_list("/videos/straight/all-popular.html")
+async def hc_home(pages: int = Query(2, ge=1, le=5, description="Pages per shelf to merge")):
+    recent, br, nr, _, mr = await _hc_fetch_pages("recent", 1, pages)
+    popular, bp, np_, _, mp = await _hc_fetch_pages("popular", 1, pages)
+    cartoon, bc, nc, _, mc = await _hc_fetch_pages("category", 1, 1, "cartoon-popular")
     return ok({
         "recent": recent,
         "popular": popular,
+        "cartoon": cartoon,
         "sections": [
-            {"title": "Most Recent", "items": recent},
-            {"title": "Most Popular", "items": popular},
+            {"title": "Most Recent", "items": recent, "kind": "recent"},
+            {"title": "Most Popular", "items": popular, "kind": "popular"},
+            {"title": "Cartoon", "items": cartoon, "kind": "category", "tag": "cartoon-popular"},
         ],
-    }, provider="hentaicity", level="private", endpoint="home",
-       blocked=br or bp, note=nr if br else np_)
+        "pagination": {"max_page": HC_MAX_PAGE, "recent_has_more": mr, "popular_has_more": mp},
+    }, provider="hentaicity", level="private", endpoint="home", blocked=br or bp, note=nr if br else np_)
 
 @app.get("/hc/recent", tags=["HentaiCity"])
-async def hc_recent(page: int = Query(1, ge=1, le=50)):
-    path = "/videos/straight/all-recent.html" if page <= 1 else f"/videos/straight/all-recent-{page}.html"
-    items, blocked, note = await _hc_fetch_list(path)
-    return ok(
-        {"items": items, "page": page},
-        provider="hentaicity", level="private", count=len(items), endpoint="recent",
-        blocked=blocked, note=note,
-    )
+async def hc_recent(
+    page: int = Query(1, ge=1, le=HC_MAX_PAGE),
+    pages: int = Query(1, ge=1, le=10, description="Merge N pages starting at page"),
+):
+    items, blocked, note, path, has_more = await _hc_fetch_pages("recent", page, pages)
+    return ok({
+        "items": items,
+        "page": page,
+        "pages_merged": pages,
+        "next_page": page + pages if has_more else None,
+        "has_more": has_more,
+        "max_page": HC_MAX_PAGE,
+        "path": path,
+    }, provider="hentaicity", level="private", count=len(items), endpoint="recent", blocked=blocked, note=note)
 
 @app.get("/hc/popular", tags=["HentaiCity"])
-async def hc_popular(page: int = Query(1, ge=1, le=50)):
-    path = "/videos/straight/all-popular.html" if page <= 1 else f"/videos/straight/all-popular-{page}.html"
-    items, blocked, note = await _hc_fetch_list(path)
-    return ok(
-        {"items": items, "page": page},
-        provider="hentaicity", level="private", count=len(items), endpoint="popular",
-        blocked=blocked, note=note,
-    )
+async def hc_popular(
+    page: int = Query(1, ge=1, le=HC_MAX_PAGE),
+    pages: int = Query(1, ge=1, le=10),
+):
+    items, blocked, note, path, has_more = await _hc_fetch_pages("popular", page, pages)
+    return ok({
+        "items": items,
+        "page": page,
+        "pages_merged": pages,
+        "next_page": page + pages if has_more else None,
+        "has_more": has_more,
+        "max_page": HC_MAX_PAGE,
+        "path": path,
+    }, provider="hentaicity", level="private", count=len(items), endpoint="popular", blocked=blocked, note=note)
 
 @app.get("/hc/category", tags=["HentaiCity"])
 async def hc_category(
-    tag: str = Query("cartoon", description="e.g. cartoon, anal, bigtits, babe, 3d, blowjob"),
+    tag: str = Query("cartoon", description="cartoon, 3d, anal, bigtits, babe, blowjob…"),
     sort: str = Query("popular", description="popular|recent"),
-    page: int = Query(1, ge=1, le=30),
+    page: int = Query(1, ge=1, le=HC_MAX_PAGE),
+    pages: int = Query(1, ge=1, le=5),
 ):
     tag = re.sub(r"[^a-z0-9]", "", tag.lower()) or "cartoon"
     sort = "recent" if sort == "recent" else "popular"
-    if page <= 1:
-        path = f"/videos/straight/{tag}-{sort}.html"
-    else:
-        path = f"/videos/straight/{tag}-{sort}-{page}.html"
-    items, blocked, note = await _hc_fetch_list(path)
-    return ok(
-        {"items": items, "tag": tag, "sort": sort, "page": page},
-        provider="hentaicity", level="private", count=len(items), endpoint="category",
-        blocked=blocked, note=note,
-    )
+    full = f"{tag}-{sort}"
+    items, blocked, note, path, has_more = await _hc_fetch_pages("category", page, pages, full)
+    return ok({
+        "items": items, "tag": tag, "sort": sort, "page": page,
+        "next_page": page + pages if has_more else None, "has_more": has_more, "max_page": HC_MAX_PAGE,
+    }, provider="hentaicity", level="private", count=len(items), endpoint="category", blocked=blocked, note=note)
 
 @app.get("/hc/categories", tags=["HentaiCity"])
 async def hc_categories():
-    """Common category tags for /hc/category?tag="""
     tags = [
-        "cartoon", "3d", "anal", "babe", "bigdick", "bigtits", "blowjob",
-        "comics", "cumshot", "hardcore", "lesbian", "milf", "teen", "creampie",
+        "cartoon", "3d", "anal", "babe", "bigdick", "bigtits", "blowjob", "comics",
+        "cumshot", "hardcore", "lesbian", "milf", "teen", "creampie", "hentai",
     ]
-    return ok(
-        [{"tag": x, "popular": f"/hc/category?tag={x}&sort=popular", "recent": f"/hc/category?tag={x}&sort=recent"} for x in tags],
-        provider="hentaicity", endpoint="categories", count=len(tags),
-    )
+    return ok([
+        {"tag": x, "popular": f"/hc/category?tag={x}&sort=popular", "recent": f"/hc/category?tag={x}&sort=recent"}
+        for x in tags
+    ], provider="hentaicity", endpoint="categories", count=len(tags))
 
 @app.get("/hc/search", tags=["HentaiCity"])
 async def hc_search(q: str = Query(..., min_length=1), page: int = Query(1, ge=1, le=20)):
     q = q.strip()
-    # Official search: customsearch.php → /search/videos/{query}
     text, blocked = await _hc_get("/customsearch.php", {
-        "search": q,
-        "search_type": "videos",
-        "main_cat": "straight",
+        "search": q, "search_type": "videos", "main_cat": "straight",
     })
-    items = _hc_list(text) if text else []
+    items = [i for i in (_hc_list(text) if text else []) if i.get("folder")]
     note = "live"
     if not items:
-        # try path form
-        slug = re.sub(r"\s+", "-", q.lower())
-        slug = re.sub(r"[^a-z0-9\-]", "", slug)
+        slug = re.sub(r"[^a-z0-9\-]+", "-", q.lower()).strip("-")
         text2, blocked2 = await _hc_get(f"/search/videos/{slug}")
         blocked = blocked or blocked2
         if text2:
-            items = _hc_list(text2)
+            items = [i for i in _hc_list(text2) if i.get("folder")]
     if not items:
-        # filter seed by keyword
         ql = q.lower()
         items = [x for x in _hc_seed_items() if ql in x["title"].lower() or ql in x["id"].lower()]
         if not items:
             items = _hc_seed_items()
-        note = "blocked_or_empty_seed"
-        blocked = True
-    return ok(
-        {"items": items, "query": q, "page": page},
-        provider="hentaicity", level="private", count=len(items), endpoint="search",
-        blocked=blocked, note=note,
-    )
+        note, blocked = "blocked_or_empty_seed", True
+    return ok({
+        "items": items, "query": q, "page": page, "suggestions": [i["title"] for i in items[:8]],
+    }, provider="hentaicity", level="private", count=len(items), endpoint="search", blocked=blocked, note=note)
+
+@app.get("/hc/suggest", tags=["HentaiCity"])
+async def hc_suggest(q: str = Query(..., min_length=1)):
+    """Typeahead suggestions from search results (titles + ids)."""
+    q = q.strip()
+    if len(q) < 2:
+        return ok({"suggestions": [], "items": []}, provider="hentaicity", endpoint="suggest", query=q)
+    # reuse search (lightweight)
+    res = await hc_search(q=q, page=1)
+    data = res.get("data") or {}
+    items = data.get("items") or []
+    suggestions = []
+    for it in items[:12]:
+        suggestions.append({
+            "title": it.get("title"),
+            "id": it.get("id"),
+            "folder": it.get("folder"),
+            "numeric_id": it.get("numeric_id"),
+            "poster": it.get("poster"),
+        })
+    return ok({"suggestions": suggestions, "count": len(suggestions)}, provider="hentaicity", endpoint="suggest", query=q)
+
+@app.get("/hc/recommend", tags=["HentaiCity"])
+async def hc_recommend(
+    folder: Optional[str] = None,
+    vid: Optional[str] = None,
+    tag: str = Query("cartoon"),
+    limit: int = Query(24, ge=1, le=60),
+):
+    """Recommendations: mix popular + category near current video."""
+    popular, _, _, _, _ = await _hc_fetch_pages("popular", 1, 2)
+    tag = re.sub(r"[^a-z0-9]", "", tag.lower()) or "cartoon"
+    cat, _, _, _, _ = await _hc_fetch_pages("category", 1, 1, f"{tag}-popular")
+    recent, _, _, _, _ = await _hc_fetch_pages("recent", 1, 1)
+    merged, seen = [], set()
+    for it in popular + cat + recent:
+        k = (it.get("folder"), it.get("numeric_id"))
+        if not k[0] or k in seen:
+            continue
+        if folder and vid and str(it.get("folder")) == str(folder) and str(it.get("numeric_id")) == str(vid):
+            continue
+        seen.add(k)
+        merged.append(it)
+        if len(merged) >= limit:
+            break
+    return ok({"items": merged, "count": len(merged), "based_on": {"folder": folder, "vid": vid, "tag": tag}},
+              provider="hentaicity", endpoint="recommend")
 
 @app.get("/hc/watch", tags=["HentaiCity"])
 async def hc_watch(
     folder: Optional[str] = None,
     vid: Optional[str] = None,
-    id: Optional[str] = Query(None, description="Slug id from list"),
+    id: Optional[str] = None,
     url: Optional[str] = None,
 ):
-    """Build all stream CDN URLs + metadata. Prefer folder+vid."""
     title = None
-    page_url = url
     if (not folder or not vid) and url:
-        # try fetch page for poster path
-        text, blocked = await _hc_get(url if url.startswith("http") else url)
+        text, _ = await _hc_get(url if url.startswith("http") else url)
         if text:
-            items = _hc_list(text)
-            # also scan img
             fm = re.search(r"/videos/(\d+)/(\d+)/", text)
             if fm:
                 folder, vid = fm.group(1), fm.group(2)
+            items = _hc_list(text)
             if items:
                 title = items[0].get("title")
     if folder and vid:
         streams = _hc_cdn(folder, vid)
+        rec = await hc_recommend(folder=folder, vid=vid, limit=18)
+        rec_items = (rec.get("data") or {}).get("items") or []
         return ok({
             "title": title or f"{folder}/{vid}",
             "folder": folder,
@@ -1389,12 +1479,10 @@ async def hc_watch(
             "qualities": list(streams["mp4"].keys()) + ["hls"],
             "trailer": streams["trailer"],
             "poster": streams["poster"],
+            "recommend": rec_items,
         }, provider="hentaicity", level="private", endpoint="watch")
-    return fail(
-        "Need folder+vid (from list item) or url",
-        provider="hentaicity", endpoint="watch",
-        how="GET /hc/recent → take folder + numeric_id → /hc/watch?folder=&vid=",
-    )
+    return fail("Need folder+vid", provider="hentaicity", endpoint="watch",
+                how="GET /hc/recent?page=1 → folder + numeric_id → /hc/watch?folder=&vid=")
 
 @app.get("/hc/cdn", tags=["HentaiCity"])
 async def hc_cdn(folder: str, vid: str):
@@ -1402,16 +1490,45 @@ async def hc_cdn(folder: str, vid: str):
 
 @app.get("/hc/streams", tags=["HentaiCity"])
 async def hc_streams(folder: str, vid: str):
-    """Flat list of playable URLs for players (quality switcher)."""
     s = _hc_cdn(folder, vid)
-    out = []
-    for q, u in s["mp4"].items():
-        out.append({"label": q, "quality": q, "kind": "mp4", "url": u})
+    out = [{"label": q, "quality": q, "kind": "mp4", "url": u} for q, u in s["mp4"].items()]
     out.append({"label": "HLS", "quality": "adaptive", "kind": "hls", "url": s["hls"]})
+    return ok({"folder": folder, "vid": vid, "poster": s["poster"], "trailer": s["trailer"], "sources": out, "count": len(out)},
+              provider="hentaicity", endpoint="streams")
+
+@app.get("/hc/feed", tags=["HentaiCity"])
+async def hc_feed(
+    page: int = Query(1, ge=1, le=HC_MAX_PAGE),
+    pages: int = Query(3, ge=1, le=10),
+    mix: str = Query("recent", description="recent|popular|both"),
+):
+    """Bulk feed for infinite scroll — merge multiple list pages."""
+    items = []
+    if mix in ("recent", "both"):
+        a, _, _, _, ha = await _hc_fetch_pages("recent", page, pages)
+        items.extend(a)
+        has_more = ha
+    else:
+        has_more = False
+    if mix in ("popular", "both"):
+        b, _, _, _, hb = await _hc_fetch_pages("popular", page, pages)
+        items.extend(b)
+        has_more = has_more or hb
+    seen, uniq = set(), []
+    for it in items:
+        k = (it.get("folder"), it.get("numeric_id"))
+        if k in seen:
+            continue
+        seen.add(k)
+        uniq.append(it)
     return ok({
-        "folder": folder, "vid": vid, "poster": s["poster"], "trailer": s["trailer"],
-        "sources": out, "count": len(out),
-    }, provider="hentaicity", endpoint="streams")
+        "items": uniq,
+        "page": page,
+        "next_page": page + pages if has_more else None,
+        "has_more": has_more,
+        "max_page": HC_MAX_PAGE,
+        "count": len(uniq),
+    }, provider="hentaicity", endpoint="feed")
 
 # ========== Aggregate / Meta ==========
 
@@ -3132,7 +3249,7 @@ footer{text-align:center;color:var(--mu);font-size:12px;padding:20px 0 10px}
 </head>
 <body>
 <header class="top">
-  <div class="brand"><div class="logo">SH</div><div><h1>StreamHub API</h1><small>v8.2.2 · creator: shawon</small></div></div>
+  <div class="brand"><div class="logo">SH</div><div><h1>StreamHub API</h1><small>v8.2.3 · creator: shawon</small></div></div>
   <div class="search"><span style="opacity:.4;font-size:13px">⌕</span><input id="q" placeholder="Filter endpoints…" oninput="filt()"/></div>
 </header>
 <div class="tabs" id="tabs"></div>
@@ -3172,11 +3289,19 @@ const E = [
 {g:'Dramachi',p:'/dr/detail',how:'Metadata only (no public stream CDN).',params:[{n:'id',v:'524'},{n:'content',v:'movies'}]},
 {g:'Dramachi',p:'/dr/thumb',how:'Poster by thumb filename.',params:[{n:'name',v:'godlovescaviar2012h.jpg'}]},
 {g:'IPTV',p:'/iptv/channels',how:'Live M3U. source 0=global 1=BD 2=IN.',params:[{n:'source',v:'0'},{n:'limit',v:'30'},{n:'q',v:''}]},
-{g:'HentaiCity',p:'/hc/home',how:'Recent + popular shelves.',params:[]},
-{g:'HentaiCity',p:'/hc/recent',how:'Recent list (seed CDN if IP blocked).',params:[]},
-{g:'HentaiCity',p:'/hc/popular',how:'Popular list.',params:[]},
-{g:'HentaiCity',p:'/hc/search',how:'Search (seed fallback on block).',params:[{n:'q',v:'anime'}]},
-{g:'HentaiCity',p:'/hc/watch',how:'Build streams from folder+vid.',params:[{n:'folder',v:'0267'},{n:'vid',v:'38191'}]},
+{g:'HentaiCity',p:'/hc/home',how:'Recent+popular+cartoon. pages=2 merges 2 list pages each.',params:[{n:'pages',v:'2'}]},
+{g:'HentaiCity',p:'/hc/recent',how:'Paginated recent. page=1..140, pages=N merges N pages (~34 each).',params:[{n:'page',v:'1'},{n:'pages',v:'2'}]},
+{g:'HentaiCity',p:'/hc/popular',how:'Paginated popular. Same page system.',params:[{n:'page',v:'1'},{n:'pages',v:'2'}]},
+{g:'HentaiCity',p:'/hc/feed',how:'Infinite-scroll feed. mix=recent|popular|both.',params:[{n:'page',v:'1'},{n:'pages',v:'3'},{n:'mix',v:'recent'}]},
+{g:'HentaiCity',p:'/hc/search',how:'Official search. Returns items + suggestions titles.',params:[{n:'q',v:'school'}]},
+{g:'HentaiCity',p:'/hc/suggest',how:'Typeahead: title/folder/poster suggestions while typing.',params:[{n:'q',v:'tea'}]},
+{g:'HentaiCity',p:'/hc/recommend',how:'Recommended mix (popular+category). Pass folder+vid to exclude current.',params:[{n:'tag',v:'cartoon'},{n:'limit',v:'24'}]},
+{g:'HentaiCity',p:'/hc/category',how:'Category list. tag=cartoon|3d|bigtits…',params:[{n:'tag',v:'cartoon'},{n:'sort',v:'popular'},{n:'page',v:'1'}]},
+{g:'HentaiCity',p:'/hc/categories',how:'All category tags.',params:[]},
+{g:'HentaiCity',p:'/hc/watch',how:'Streams + recommend[]. CDN poster/trailer.',params:[{n:'folder',v:'0498'},{n:'vid',v:'38179'}]},
+{g:'HentaiCity',p:'/hc/streams',how:'Flat sources for quality UI.',params:[{n:'folder',v:'0498'},{n:'vid',v:'38179'}]},
+{g:'HentaiCity',p:'/hc/cdn',how:'Raw CDN map.',params:[{n:'folder',v:'0498'},{n:'vid',v:'38179'}]},
+{n:'vid',v:'38191'}]},
 {g:'HentaiCity',p:'/hc/cdn',how:'Always builds HLS+MP4 from folder+vid.',params:[{n:'folder',v:'0267'},{n:'vid',v:'38191'}]},
 {g:'HindiAnime',p:'/ha/catalog',how:'Full movies+series catalog (hindianime.site).',params:[{n:'kind',v:'all'}]},
 {g:'HindiAnime',p:'/ha/home',how:'Home: topAiring, popular, latest…',params:[]},
@@ -3947,6 +4072,11 @@ html[data-size=l] .grid{grid-template-columns:repeat(auto-fill,minmax(150px,1fr)
 @media(min-width:900px){html:not(.lite) #dbg{filter:blur(40px) saturate(1.3);opacity:.32;transform:scale(1.2)}}
 
 
+
+.hc-sug{position:absolute;left:0;right:0;top:100%;z-index:30;margin-top:6px;background:rgba(12,14,28,.96);border:1px solid var(--line);border-radius:14px;max-height:280px;overflow:auto;box-shadow:0 16px 40px #000a;backdrop-filter:blur(12px)}
+.hc-sug-i{display:flex;align-items:center;gap:10px;width:100%;padding:10px 12px;border:0;background:transparent;color:var(--txt);text-align:left;cursor:pointer;font:600 13px var(--ff)}
+.hc-sug-i:hover{background:rgba(255,255,255,.06)}
+.hc-sug-i img{width:48px;height:32px;object-fit:cover;border-radius:6px;background:#222}
 .trbadge{position:absolute;left:8px;bottom:8px;z-index:3;font:700 9px/1 var(--ff);letter-spacing:.04em;padding:5px 7px;border-radius:8px;background:rgba(0,0,0,.72);color:#fff;backdrop-filter:blur(6px);opacity:.9;pointer-events:none}
 .poster.trailer-on video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;z-index:2;border-radius:inherit}
 .poster.trailer-on img{opacity:0}
@@ -5079,41 +5209,79 @@ function pgHentaiCity(){
     V.innerHTML='<div class="pg gate"><div class="box"><div class="moon"></div><h1>HentaiCity</h1><p>Adult-only streams. Continue only if you are 18+ and it is legal where you live.</p><div class="acts"><button class="btn pri" id="y18">I am 18 or older</button><a class="btn ghost" href="#/home">Back</a></div></div></div>';
     $('#y18').onclick=()=>{store.set('sh_18',true);pgHentaiCity()};return;
   }
-  const st={q:'',busy:false};
-  V.innerHTML='<div class="pg"><div class="ph"><h1>HentaiCity</h1><p>Direct MP4 + HLS · hold any poster to preview trailer · tap for quality player.</p><div class="acts" style="margin-top:12px"><a class="btn sm ghost" href="#/midnight">Midnight</a><button class="btn sm ghost" id="lock18">Lock 18+</button></div></div>'
-    +sBox('hcq','Search HentaiCity…')
-    +'<div id="hcrows">'+skelRow()+skelRow()+'</div><div id="hcg" class="grid" style="display:none"></div></div>';
+  const st={mode:'feed',page:1,busy:false,done:false,q:''};
+  V.innerHTML='<div class="pg"><div class="ph"><h1>HentaiCity</h1><p>Thousands of videos · hold poster for trailer · infinite scroll</p><div class="acts" style="margin-top:12px"><a class="btn sm ghost" href="#/midnight">Midnight</a><button class="btn sm ghost" id="lock18">Lock 18+</button></div></div>'
+    +'<div style="position:relative;max-width:560px;margin:0 auto 8px">'+sBox('hcq','Search HentaiCity…')+'<div id="hcsug" class="hc-sug" style="display:none"></div></div>'
+    +'<div class="chips" id="hcchips">'
+    +[['Feed','feed'],['Recent','recent'],['Popular','popular'],['Cartoon','cartoon'],['3D','3d'],['Big Tits','bigtits']].map((x,i)=>'<button class="chip'+(i===0?' on':'')+'" data-mode="'+x[1]+'">'+x[0]+'</button>').join('')
+    +'</div>'
+    +'<div id="hcrows"></div><div id="hcg" class="grid"></div>'
+    +'<div class="more-wrap"><button class="btn ghost" id="hcmore">Load more</button></div></div>';
   $('#lock18').onclick=()=>{store.set('sh_18',false);toast('Locked');pgHentaiCity()};
-  const paint=()=>{
-    api('/hc/home').then(j=>{
-      if(my!==App.nav)return;const d=D(j)||{};
-      const secs=d.sections||[{title:'Most Recent',items:d.recent||[]},{title:'Most Popular',items:d.popular||[]}];
-      let h='';
-      secs.forEach(sec=>{
-        const items=(sec.items||[]).map(hcItem).filter(Boolean);
-        items.forEach(x=>SEEN.set('hc:'+x.folder+'/'+x.numeric_id,x));
-        h+=row('HentaiCity · '+(sec.title||'Videos'),items);
-      });
-      $('#hcrows').innerHTML=h||emptyBox('No items','If blocked on server IP, seed titles still stream via CDN.');
-    }).catch(e=>{$('#hcrows').innerHTML=emptyBox('HentaiCity',e.message)});
+  const g=$('#hcg'), more=$('#hcmore'), rows=$('#hcrows'), sug=$('#hcsug');
+  const addCards=(items,reset)=>{
+    const cards=items.map(hcItem).filter(Boolean);
+    cards.forEach(x=>SEEN.set('hc:'+x.folder+'/'+x.numeric_id,x));
+    if(reset)g.innerHTML='';
+    g.insertAdjacentHTML('beforeend',cards.map(x=>card(x)).join(''));
   };
-  paint();
-  const g=$('#hcg');
-  const search=async q=>{
-    if(st.busy)return;st.busy=true;g.style.display='';$('#hcrows').style.display='none';g.innerHTML=skelGrid(12).replace('<div class="grid">','').replace(/<\/div>$/,'');
+  const load=async reset=>{
+    if(st.busy||st.done&&!reset)return;st.busy=true;more.disabled=true;
+    if(reset){st.page=1;st.done=false;g.innerHTML=skelGrid(12).replace('<div class="grid">','').replace(/<\/div>$/,'')}
     try{
-      const j=await api('/hc/search?q='+enc(q),{ttl:120000});
-      const raw=D(j)||{};const arr=Array.isArray(raw)?raw:(raw.items||raw.data||[]);
-      const items=arr.map(hcItem).filter(Boolean);
-      items.forEach(x=>SEEN.set('hc:'+x.folder+'/'+x.numeric_id,x));
-      g.innerHTML=items.map(x=>card(x)).join('')||'<div class="empty" style="grid-column:1/-1"><b>No results</b></div>';
-    }catch(e){g.innerHTML='<div style="grid-column:1/-1">'+emptyBox('Search failed',e.message)+'</div>'}
-    finally{st.busy=false}
+      let j,items=[],has=false,next=null;
+      if(st.q){
+        j=await api('/hc/search?q='+enc(st.q),{ttl:120000});
+        const d=D(j)||{};items=d.items||[];has=false;
+      }else if(st.mode==='feed'){
+        j=await api('/hc/feed?page='+st.page+'&pages=2&mix=recent',{ttl:180000,timeout:90000});
+        const d=D(j)||{};items=d.items||[];has=!!d.has_more;next=d.next_page;
+      }else if(st.mode==='recent'||st.mode==='popular'){
+        j=await api('/hc/'+st.mode+'?page='+st.page+'&pages=2',{ttl:180000,timeout:90000});
+        const d=D(j)||{};items=d.items||[];has=!!d.has_more;next=d.next_page;
+      }else{
+        j=await api('/hc/category?tag='+enc(st.mode)+'&sort=popular&page='+st.page+'&pages=2',{ttl:180000,timeout:90000});
+        const d=D(j)||{};items=d.items||[];has=!!d.has_more;next=d.next_page;
+      }
+      if(my!==App.nav)return;
+      addCards(items,reset);
+      if(!items.length&&reset)g.innerHTML='<div class="empty" style="grid-column:1/-1"><b>No videos</b><p>Try another tab or search.</p></div>';
+      if(has&&next){st.page=next;st.done=false}else if(has){st.page+=2;st.done=false}else{st.done=true}
+    }catch(e){if(reset)g.innerHTML='<div style="grid-column:1/-1">'+emptyBox('Failed',e.message)+'</div>'}
+    finally{st.busy=false;more.disabled=st.done;more.style.display=st.done?'none':''}
   };
-  $('#hcq').oninput=debounce(e=>{const q=e.target.value.trim();if(!q){$('#hcrows').style.display='';g.style.display='none';return}search(q)},450);
+  more.onclick=()=>load(false);lazyMore(more,()=>load(false));
+  $('#hcchips').onclick=e=>{const b=e.target.closest('[data-mode]');if(!b)return;
+    $$('#hcchips .chip').forEach(c=>c.classList.remove('on'));b.classList.add('on');
+    st.mode=b.dataset.mode;st.q='';$('#hcq').value='';sug.style.display='none';rows.innerHTML='';load(true)};
+  // search + suggestions
+  $('#hcq').oninput=debounce(async e=>{
+    const q=e.target.value.trim();st.q=q;
+    if(q.length<2){sug.style.display='none';if(!q){rows.innerHTML='';load(true)}return}
+    try{
+      const j=await api('/hc/suggest?q='+enc(q),{ttl:60000});
+      const list=(D(j).suggestions||[]);
+      if(!list.length){sug.style.display='none'}
+      else{
+        sug.style.display='';
+        sug.innerHTML=list.map(s=>'<button type="button" class="hc-sug-i" data-f="'+esc(s.folder||'')+'" data-v="'+esc(s.numeric_id||'')+'" data-t="'+esc(s.title||'')+'">'
+          +(s.poster?'<img alt="" src="'+esc(s.poster)+'" referrerpolicy="no-referrer" onerror="this.style.display=\'none\'">':'')
+          +'<span>'+esc(s.title||'')+'</span></button>').join('');
+      }
+    }catch(_){sug.style.display='none'}
+    load(true);
+  },400);
+  sug.onclick=e=>{const b=e.target.closest('[data-f]');if(!b||!b.dataset.f)return;
+    location.hash='#/hc/'+enc(b.dataset.f)+'/'+enc(b.dataset.v)};
+  // shelves on top once
+  api('/hc/home?pages=1').then(j=>{
+    if(my!==App.nav)return;const d=D(j)||{};
+    rows.innerHTML=(d.sections||[]).slice(0,2).map(sec=>row('HC · '+(sec.title||''),(sec.items||[]).map(hcItem).filter(Boolean))).join('');
+  }).catch(()=>{});
+  load(true);
 }
 
-function hcSources(streams){
+function hcSourcesfunction hcSources(streams){
   if(!streams)return[];
   const out=[];
   const mp4=streams.mp4||{};
@@ -5176,13 +5344,31 @@ async function dtHC(folder,vid,q){
     {k:'dl',l:'Downloads',fn:c=>{
       c.innerHTML='<div class="dl">'+srcs.map(s=>linkRow({label:s.label,url:s.url,kind:s.kind,quality:s.quality})).join('')+'</div>';
     }},
+    {k:'rec',l:'Recommend',fn:async c=>{
+      c.innerHTML='<div class="skrow">'+'<div class="sk"></div>'.repeat(6)+'</div>';
+      try{
+        const j=await api('/hc/recommend?folder='+enc(folder)+'&vid='+enc(vid)+'&limit=24',{ttl:180000});
+        const items=(D(j).items||[]).map(hcItem).filter(Boolean);
+        items.forEach(x=>SEEN.set('hc:'+x.folder+'/'+x.numeric_id,x));
+        c.innerHTML=items.length?'<div class="grid">'+items.map(x=>card(x)).join('')+'</div>':'<div class="note">No recommendations</div>';
+      }catch(e){c.innerHTML='<div class="note warn">'+esc(e.message)+'</div>'}
+    }},
     {k:'info',l:'Info',fn:c=>{
       c.innerHTML='<div class="panel"><p class="dd">Folder <b>'+esc(folder)+'</b> · ID <b>'+esc(vid)+'</b></p>'
-        +'<p class="dd">Hold any poster on the grid to preview the trailer. Quality buttons switch the in-page player.</p>'
+        +'<p class="dd">Hold poster for trailer · use quality chips to switch · Recommend tab for more.</p>'
         +(it.trailer?'<p class="dd"><a href="'+esc(it.trailer)+'" target="_blank" rel="noopener">Open trailer URL</a></p>':'')
         +'</div>';
     }}
   ],'dl');
+  // auto recommend row under player
+  api('/hc/recommend?folder='+enc(folder)+'&vid='+enc(vid)+'&limit=16').then(j=>{
+    if(my!==DT.id)return;
+    const items=(D(j).items||[]).map(hcItem).filter(Boolean);
+    if(!items.length)return;
+    items.forEach(x=>SEEN.set('hc:'+x.folder+'/'+x.numeric_id,x));
+    const host=$('#tabsbox');
+    if(host)host.insertAdjacentHTML('beforebegin','<div id="hcrec">'+row('More like this',items)+'</div>');
+  }).catch(()=>{});
   if(q.get('play'))play();
 }
 function _hc_client_cdn(folder,vid){
