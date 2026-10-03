@@ -1,4 +1,4 @@
-# StreamHub API v8.2.1 — creator: shawon
+# StreamHub API v8.2.2 — creator: shawon
 from __future__ import annotations
 
 import asyncio, base64, gzip, hashlib, hmac, json, random, re, time, uuid
@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response, StreamingResponse, PlainTextResponse
 
-CREATOR, VERSION = "shawon", "8.2.1"
+CREATOR, VERSION = "shawon", "8.2.2"
 app = FastAPI(title="StreamHub API", version=VERSION, docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -1100,13 +1100,16 @@ async def iptv_channels(source: int = 0, q: Optional[str] = None, limit: int = 5
 
 # ========== HentaiCity ==========
 HC_BASE = "https://www.hentaicity.com"
-# Verified working folder/id pairs (CDN returns 200) used when datacenter IP is blocked
+# Fallback when datacenter IP is geo/privacy blocked — real folder/vid + real titles
 _HC_SEED = [
-    {"folder": "0267", "vid": "38191", "id": "seed-0267-38191", "title": "Sample stream A (CDN seed)"},
-    {"folder": "0449", "vid": "38135", "id": "seed-0449-38135", "title": "Sample stream B (CDN seed)"},
-    {"folder": "0730", "vid": "38155", "id": "seed-0730-38155", "title": "Sample stream C (CDN seed)"},
-    {"folder": "0131", "vid": "38132", "id": "seed-0131-38132", "title": "Sample stream D (CDN seed)"},
-    {"folder": "0739", "vid": "38186", "id": "seed-0739-38186", "title": "Sample stream E (CDN seed)"},
+    {"folder": "0498", "vid": "38179", "id": "fuck-the-spire", "title": "Fuck the Spire - JOI game play"},
+    {"folder": "0626", "vid": "38136", "id": "weak-teacher-2", "title": "Weak Teacher 2 (ecchi anime)"},
+    {"folder": "0449", "vid": "38135", "id": "weak-teacher-1", "title": "Weak Teacher 1 (ecchi anime)"},
+    {"folder": "0267", "vid": "38191", "id": "confession-4", "title": "Confession... 4 - Busty hentai teen"},
+    {"folder": "0120", "vid": "38190", "id": "shrouded-in-mist-2", "title": "Shrouded in Mist 2"},
+    {"folder": "0341", "vid": "38189", "id": "lonely-snow-widow-1", "title": "The Lonely Snow Widow and the Cursed Ring 1"},
+    {"folder": "0616", "vid": "33668", "id": "my-sister-is-cute-1", "title": "My Sister is Cute 1"},
+    {"folder": "0745", "vid": "32125", "id": "fandel-tales", "title": "Fandel Tales: The Cursed Prince"},
 ]
 
 def _hc_cdn(folder: str, vid: str) -> dict:
@@ -1127,15 +1130,25 @@ def _hc_cdn(folder: str, vid: str) -> dict:
         "poster": f"https://cdn1.images.hentaicity.com/videos/{folder}/{vid}/main.jpg",
         "poster_hd": f"https://cdn1.images.hentaicity.com/videos/{folder}/{vid}/1080p.jpg",
         "trailer": f"https://cdn1.hentaicity.com/{folder}/{vid}/trailer.mp4",
+        "page": f"{HC_BASE}/video/",
     }
+
+def _hc_clean_title(title: str, fallback: str) -> str:
+    t = " ".join((title or "").split()).strip()
+    junk = {"view", "play", "watch", "video", "more", "hd"}
+    if not t or t.lower() in junk or (len(t) <= 2):
+        t = fallback.replace("-", " ")
+    # strip trailing site noise
+    t = re.sub(r"\s*\|\s*HentaiCity.*$", "", t, flags=re.I)
+    return t[:160]
 
 def _hc_list(html: str) -> list:
     soup = BeautifulSoup(html, "html.parser")
     items = []
     seen = set()
-    for a in soup.select("a[href]"):
+    for a in soup.select("a[href*='/video/']"):
         href = a.get("href") or ""
-        m = re.search(r"/video/([^/]+\.html)", href)
+        m = re.search(r"/video/([^/?#]+\.html)", href)
         if not m or "all-" in href:
             continue
         slug = m.group(1)
@@ -1144,9 +1157,18 @@ def _hc_list(html: str) -> list:
             continue
         seen.add(vid_key)
         img = a.find("img")
+        if not img and a.parent:
+            img = a.parent.find("img")
         poster = folder = vid_num = None
         if img:
-            poster = img.get("src") or img.get("data-src") or img.get("data-original")
+            poster = (
+                img.get("data-src")
+                or img.get("data-original")
+                or img.get("data-lazy-src")
+                or img.get("src")
+            )
+            if poster and poster.startswith("//"):
+                poster = "https:" + poster
             if poster:
                 fm = re.search(r"/videos/(\d+)/(\d+)/", poster)
                 if fm:
@@ -1156,15 +1178,20 @@ def _hc_list(html: str) -> list:
             title = (img.get("alt") or img.get("title") or "").strip()
         if not title:
             title = " ".join(a.get_text().split())
-        if not title or (len(title) <= 8 and any(ch.isdigit() for ch in title)):
-            title = vid_key.replace("-", " ")[:90]
+        title = _hc_clean_title(title, vid_key)
         full = href if href.startswith("http") else urljoin(HC_BASE, href)
         item = {
-            "id": vid_key, "slug": slug, "title": title, "url": full,
-            "poster": poster, "folder": folder, "numeric_id": vid_num,
+            "id": vid_key,
+            "slug": slug,
+            "title": title,
+            "url": full,
+            "poster": poster,
+            "folder": folder,
+            "numeric_id": vid_num,
         }
         if folder and vid_num:
             item["streams"] = _hc_cdn(folder, vid_num)
+            item["trailer"] = item["streams"]["trailer"]
         items.append(item)
     return items
 
@@ -1173,130 +1200,218 @@ def _hc_seed_items():
     for s in _HC_SEED:
         streams = _hc_cdn(s["folder"], s["vid"])
         out.append({
-            "id": s["id"], "title": s["title"], "folder": s["folder"], "numeric_id": s["vid"],
-            "poster": streams["poster"], "streams": streams, "seed": True,
+            "id": s["id"],
+            "title": s["title"],
+            "folder": s["folder"],
+            "numeric_id": s["vid"],
+            "poster": streams["poster"],
+            "trailer": streams["trailer"],
+            "streams": streams,
+            "seed": True,
+            "url": f"{HC_BASE}/video/{s['id']}.html",
         })
     return out
 
-async def _hc_fetch_list(path: str) -> tuple:
-    """Returns (items, blocked: bool, note)."""
+async def _hc_get(path: str, params: dict = None) -> tuple:
+    """Fetch HTML. Returns (text|None, blocked: bool)."""
     headers_list = [
-        {"User-Agent": UA, "Referer": "https://www.google.com/", "Accept": "text/html", "Accept-Language": "en-US,en;q=0.9"},
-        {"User-Agent": MOBILE_UA, "Referer": HC_BASE + "/", "Accept": "text/html"},
+        {
+            "User-Agent": UA,
+            "Referer": HC_BASE + "/",
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
+        },
+        {
+            "User-Agent": MOBILE_UA,
+            "Referer": "https://www.google.com/",
+            "Accept": "text/html",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
     ]
-    async with _client(22) as client:
+    async with _client(28.0) as client:
         for headers in headers_list:
             try:
-                r = await client.get(urljoin(HC_BASE, path), headers=headers)
-                if "defendonlineprivacy" in str(r.url) or "defendonlineprivacy" in r.text[:800]:
+                r = await client.get(urljoin(HC_BASE, path), params=params or {}, headers=headers)
+                text = r.text or ""
+                if "defendonlineprivacy" in str(r.url) or "defendonlineprivacy" in text[:1200]:
                     continue
-                items = _hc_list(r.text)
-                if items:
-                    return items, False, "live"
+                if r.status_code >= 400 and r.status_code != 404:
+                    continue
+                if len(text) < 500:
+                    continue
+                return text, False
             except Exception:
                 continue
-    return _hc_seed_items(), True, "HentaiCity HTML blocked on this server IP. Returning CDN seed items (real working streams). Use /hc/cdn?folder=&vid= for any id."
+    return None, True
+
+async def _hc_fetch_list(path: str) -> tuple:
+    text, blocked = await _hc_get(path)
+    if text:
+        items = _hc_list(text)
+        # only keep items with folder+vid when possible; else keep all
+        with_cdn = [i for i in items if i.get("folder") and i.get("numeric_id")]
+        use = with_cdn or items
+        if use:
+            return use, False, "live"
+    return _hc_seed_items(), True, (
+        "HentaiCity HTML blocked or empty on this server IP. "
+        "Showing curated seed with real CDN paths. Deploy on residential IP for full catalog."
+    )
+
+@app.get("/hc/home", tags=["HentaiCity"])
+async def hc_home():
+    """Homepage shelves: recent + popular."""
+    recent, br, nr = await _hc_fetch_list("/videos/straight/all-recent.html")
+    popular, bp, np_ = await _hc_fetch_list("/videos/straight/all-popular.html")
+    return ok({
+        "recent": recent,
+        "popular": popular,
+        "sections": [
+            {"title": "Most Recent", "items": recent},
+            {"title": "Most Popular", "items": popular},
+        ],
+    }, provider="hentaicity", level="private", endpoint="home",
+       blocked=br or bp, note=nr if br else np_)
 
 @app.get("/hc/recent", tags=["HentaiCity"])
-async def hc_recent():
-    items, blocked, note = await _hc_fetch_list("/videos/straight/all-recent.html")
-    return ok(items, provider="hentaicity", level="private", count=len(items), endpoint="recent",
-              blocked=blocked, note=note)
+async def hc_recent(page: int = Query(1, ge=1, le=50)):
+    path = "/videos/straight/all-recent.html" if page <= 1 else f"/videos/straight/all-recent-{page}.html"
+    items, blocked, note = await _hc_fetch_list(path)
+    return ok(
+        {"items": items, "page": page},
+        provider="hentaicity", level="private", count=len(items), endpoint="recent",
+        blocked=blocked, note=note,
+    )
 
 @app.get("/hc/popular", tags=["HentaiCity"])
-async def hc_popular():
-    items, blocked, note = await _hc_fetch_list("/videos/straight/all-popular.html")
-    return ok(items, provider="hentaicity", level="private", count=len(items), endpoint="popular",
-              blocked=blocked, note=note)
+async def hc_popular(page: int = Query(1, ge=1, le=50)):
+    path = "/videos/straight/all-popular.html" if page <= 1 else f"/videos/straight/all-popular-{page}.html"
+    items, blocked, note = await _hc_fetch_list(path)
+    return ok(
+        {"items": items, "page": page},
+        provider="hentaicity", level="private", count=len(items), endpoint="popular",
+        blocked=blocked, note=note,
+    )
+
+@app.get("/hc/category", tags=["HentaiCity"])
+async def hc_category(
+    tag: str = Query("cartoon", description="e.g. cartoon, anal, bigtits, babe, 3d, blowjob"),
+    sort: str = Query("popular", description="popular|recent"),
+    page: int = Query(1, ge=1, le=30),
+):
+    tag = re.sub(r"[^a-z0-9]", "", tag.lower()) or "cartoon"
+    sort = "recent" if sort == "recent" else "popular"
+    if page <= 1:
+        path = f"/videos/straight/{tag}-{sort}.html"
+    else:
+        path = f"/videos/straight/{tag}-{sort}-{page}.html"
+    items, blocked, note = await _hc_fetch_list(path)
+    return ok(
+        {"items": items, "tag": tag, "sort": sort, "page": page},
+        provider="hentaicity", level="private", count=len(items), endpoint="category",
+        blocked=blocked, note=note,
+    )
+
+@app.get("/hc/categories", tags=["HentaiCity"])
+async def hc_categories():
+    """Common category tags for /hc/category?tag="""
+    tags = [
+        "cartoon", "3d", "anal", "babe", "bigdick", "bigtits", "blowjob",
+        "comics", "cumshot", "hardcore", "lesbian", "milf", "teen", "creampie",
+    ]
+    return ok(
+        [{"tag": x, "popular": f"/hc/category?tag={x}&sort=popular", "recent": f"/hc/category?tag={x}&sort=recent"} for x in tags],
+        provider="hentaicity", endpoint="categories", count=len(tags),
+    )
 
 @app.get("/hc/search", tags=["HentaiCity"])
-async def hc_search(q: str = Query(..., min_length=1)):
+async def hc_search(q: str = Query(..., min_length=1), page: int = Query(1, ge=1, le=20)):
     q = q.strip()
-    paths = [
-        f"/search/video/{quote(q)}",
-        f"/search/?q={quote(q)}",
-        f"/search/video/{quote(q.replace(' ', '-'))}",
-        f"/videos/straight/all-recent.html",  # last resort list
-    ]
-    items, blocked, note = [], True, ""
-    for path in paths:
-        items, blocked, note = await _hc_fetch_list(path)
-        if items and not blocked:
-            # if we used recent as fallback, filter by keyword in title
-            if "all-recent" in path:
-                ql = q.lower()
-                filtered = [it for it in items if ql in (it.get("title") or "").lower() or ql in (it.get("id") or "").lower()]
-                if filtered:
-                    items = filtered
-                    note = "filtered from recent list"
-                else:
-                    continue
-            break
-    if blocked or not items:
-        # seed with keyword in title if possible
-        seeds = _hc_seed_items()
+    # Official search: customsearch.php → /search/videos/{query}
+    text, blocked = await _hc_get("/customsearch.php", {
+        "search": q,
+        "search_type": "videos",
+        "main_cat": "straight",
+    })
+    items = _hc_list(text) if text else []
+    note = "live"
+    if not items:
+        # try path form
+        slug = re.sub(r"\s+", "-", q.lower())
+        slug = re.sub(r"[^a-z0-9\-]", "", slug)
+        text2, blocked2 = await _hc_get(f"/search/videos/{slug}")
+        blocked = blocked or blocked2
+        if text2:
+            items = _hc_list(text2)
+    if not items:
+        # filter seed by keyword
         ql = q.lower()
-        filtered = [s for s in seeds if ql in s["title"].lower()]
-        items = filtered or seeds
+        items = [x for x in _hc_seed_items() if ql in x["title"].lower() or ql in x["id"].lower()]
+        if not items:
+            items = _hc_seed_items()
+        note = "blocked_or_empty_seed"
         blocked = True
-        note = note or "HentaiCity HTML blocked or no matches — CDN seed returned. Use folder+vid on /hc/cdn"
-    return ok(items, provider="hentaicity", level="private", count=len(items), endpoint="search", query=q,
-              blocked=blocked, note=note)
+    return ok(
+        {"items": items, "query": q, "page": page},
+        provider="hentaicity", level="private", count=len(items), endpoint="search",
+        blocked=blocked, note=note,
+    )
 
 @app.get("/hc/watch", tags=["HentaiCity"])
 async def hc_watch(
-    id: Optional[str] = None,
-    url: Optional[str] = None,
     folder: Optional[str] = None,
-    vid: Optional[str] = Query(None, description="numeric id inside folder"),
+    vid: Optional[str] = None,
+    id: Optional[str] = Query(None, description="Slug id from list"),
+    url: Optional[str] = None,
 ):
+    """Build all stream CDN URLs + metadata. Prefer folder+vid."""
+    title = None
+    page_url = url
+    if (not folder or not vid) and url:
+        # try fetch page for poster path
+        text, blocked = await _hc_get(url if url.startswith("http") else url)
+        if text:
+            items = _hc_list(text)
+            # also scan img
+            fm = re.search(r"/videos/(\d+)/(\d+)/", text)
+            if fm:
+                folder, vid = fm.group(1), fm.group(2)
+            if items:
+                title = items[0].get("title")
     if folder and vid:
-        cdn = _hc_cdn(folder, vid)
-        sources = [{"src": cdn["hls"], "format": "hls"}] + [
-            {"src": u, "format": "mp4", "quality": q} for q, u in cdn["mp4"].items()
-        ]
+        streams = _hc_cdn(folder, vid)
         return ok({
-            "id": id, "folder": folder, "vid": vid, "streams": cdn, "sources": sources, "count": len(sources),
+            "title": title or f"{folder}/{vid}",
+            "folder": folder,
+            "numeric_id": vid,
+            "streams": streams,
+            "qualities": list(streams["mp4"].keys()) + ["hls"],
+            "trailer": streams["trailer"],
+            "poster": streams["poster"],
         }, provider="hentaicity", level="private", endpoint="watch")
-    if not id and not url:
-        raise HTTPException(400, detail=fail("Provide id, url, or folder+vid"))
-    pages = []
-    if url:
-        pages.append(url)
-    if id:
-        pages += [f"{HC_BASE}/video/{id}.html", f"{HC_BASE}/click/1-1/video/{id}.html"]
-    html = ""
-    final = pages[0]
-    async with _client() as client:
-        for page in pages:
-            try:
-                r = await client.get(page, headers={"Referer": HC_BASE + "/", "User-Agent": UA})
-                html = r.text
-                final = str(r.url)
-                if "defendonlineprivacy" in final:
-                    continue
-                if re.search(r"/flv/(\d+)/(\d+)/", html):
-                    break
-            except Exception:
-                continue
-    fm = re.search(r"/flv/(\d+)/(\d+)/", html) or re.search(r"/videos/(\d+)/(\d+)/", html)
-    if fm:
-        cdn = _hc_cdn(fm.group(1), fm.group(2))
-        sources = [{"src": cdn["hls"], "format": "hls"}] + [
-            {"src": u, "format": "mp4", "quality": q} for q, u in cdn["mp4"].items()
-        ]
-        return ok({
-            "id": id, "page": final, "streams": cdn, "sources": sources, "count": len(sources),
-        }, provider="hentaicity", level="private", endpoint="watch")
-    return ok({
-        "id": id, "page": final, "sources": [], "count": 0,
-        "hint": "HTML blocked. Use /hc/recent item folder+numeric_id → /hc/watch?folder=&vid= or /hc/cdn",
-    }, provider="hentaicity", level="private", endpoint="watch")
+    return fail(
+        "Need folder+vid (from list item) or url",
+        provider="hentaicity", endpoint="watch",
+        how="GET /hc/recent → take folder + numeric_id → /hc/watch?folder=&vid=",
+    )
 
 @app.get("/hc/cdn", tags=["HentaiCity"])
-async def hc_cdn(folder: str = Query(...), vid: str = Query(...)):
-    """Always works — builds direct HLS + MP4 URLs. No scrape."""
+async def hc_cdn(folder: str, vid: str):
     return ok(_hc_cdn(folder, vid), provider="hentaicity", level="private", endpoint="cdn")
+
+@app.get("/hc/streams", tags=["HentaiCity"])
+async def hc_streams(folder: str, vid: str):
+    """Flat list of playable URLs for players (quality switcher)."""
+    s = _hc_cdn(folder, vid)
+    out = []
+    for q, u in s["mp4"].items():
+        out.append({"label": q, "quality": q, "kind": "mp4", "url": u})
+    out.append({"label": "HLS", "quality": "adaptive", "kind": "hls", "url": s["hls"]})
+    return ok({
+        "folder": folder, "vid": vid, "poster": s["poster"], "trailer": s["trailer"],
+        "sources": out, "count": len(out),
+    }, provider="hentaicity", endpoint="streams")
 
 # ========== Aggregate / Meta ==========
 
@@ -3017,7 +3132,7 @@ footer{text-align:center;color:var(--mu);font-size:12px;padding:20px 0 10px}
 </head>
 <body>
 <header class="top">
-  <div class="brand"><div class="logo">SH</div><div><h1>StreamHub API</h1><small>v8.2.1 · creator: shawon</small></div></div>
+  <div class="brand"><div class="logo">SH</div><div><h1>StreamHub API</h1><small>v8.2.2 · creator: shawon</small></div></div>
   <div class="search"><span style="opacity:.4;font-size:13px">⌕</span><input id="q" placeholder="Filter endpoints…" oninput="filt()"/></div>
 </header>
 <div class="tabs" id="tabs"></div>
@@ -3057,6 +3172,7 @@ const E = [
 {g:'Dramachi',p:'/dr/detail',how:'Metadata only (no public stream CDN).',params:[{n:'id',v:'524'},{n:'content',v:'movies'}]},
 {g:'Dramachi',p:'/dr/thumb',how:'Poster by thumb filename.',params:[{n:'name',v:'godlovescaviar2012h.jpg'}]},
 {g:'IPTV',p:'/iptv/channels',how:'Live M3U. source 0=global 1=BD 2=IN.',params:[{n:'source',v:'0'},{n:'limit',v:'30'},{n:'q',v:''}]},
+{g:'HentaiCity',p:'/hc/home',how:'Recent + popular shelves.',params:[]},
 {g:'HentaiCity',p:'/hc/recent',how:'Recent list (seed CDN if IP blocked).',params:[]},
 {g:'HentaiCity',p:'/hc/popular',how:'Popular list.',params:[]},
 {g:'HentaiCity',p:'/hc/search',how:'Search (seed fallback on block).',params:[{n:'q',v:'anime'}]},
@@ -4930,17 +5046,16 @@ function pgMidnight(){
   $('#lock18').onclick=()=>{store.set('sh_18',false);toast('Midnight locked');pgMidnight()};
   api('/mb/adult/home').then(j=>{if(my!==App.nav)return;const r=mbSections(D(j));const secs=r.sections;if(r.hero.length)secs.unshift({title:'Featured',items:r.hero});secs.forEach(s=>s.items.forEach(i=>{i._adult=1}));$('#mrows').innerHTML=secs.map(s=>row(s.title,s.items)).join('')||''}).catch(e=>{$('#mrows').innerHTML=notice('Midnight MovieBox',e)});
   // HentaiCity shelves on Midnight
-  Promise.allSettled([api('/hc/recent'),api('/hc/popular')]).then(rs=>{
-    if(my!==App.nav)return;
+  api('/hc/home').then(j=>{
+    if(my!==App.nav)return;const d=D(j)||{};
     let h='<div class="rh" style="margin-top:8px"><h2>HentaiCity</h2><a class="btn sm ghost" href="#/hentaicity">Open full page</a></div>';
-    rs.forEach((r,i)=>{
-      if(r.status!=='fulfilled')return;
-      const items=(Array.isArray(D(r.value))?D(r.value):(D(r.value).items||D(r.value).data||[])).map(hcItem).filter(Boolean);
+    (d.sections||[{title:'Recent',items:d.recent||[]},{title:'Popular',items:d.popular||[]}]).forEach(sec=>{
+      const items=(sec.items||[]).map(hcItem).filter(Boolean);
       items.forEach(x=>SEEN.set('hc:'+x.folder+'/'+x.numeric_id,x));
-      h+=row(i===0?'HC · Recent':'HC · Popular',items);
+      h+=row('HC · '+(sec.title||'Videos'),items);
     });
     $('#mrows').insertAdjacentHTML('beforeend',h);
-  });
+  }).catch(()=>{});
   const g=$('#mg'),mm=$('#mm');
   const load=async reset=>{
     if(st.busy||!st.q)return;st.busy=true;mm.disabled=true;
@@ -4970,18 +5085,17 @@ function pgHentaiCity(){
     +'<div id="hcrows">'+skelRow()+skelRow()+'</div><div id="hcg" class="grid" style="display:none"></div></div>';
   $('#lock18').onclick=()=>{store.set('sh_18',false);toast('Locked');pgHentaiCity()};
   const paint=()=>{
-    Promise.allSettled([api('/hc/recent'),api('/hc/popular')]).then(rs=>{
-      if(my!==App.nav)return;let h='';
-      const labels=['Recent','Popular'];
-      rs.forEach((r,i)=>{
-        if(r.status!=='fulfilled')return;
-        const raw=D(r.value);const arr=Array.isArray(raw)?raw:(raw.items||raw.data||[]);
-        const items=arr.map(hcItem).filter(Boolean);
+    api('/hc/home').then(j=>{
+      if(my!==App.nav)return;const d=D(j)||{};
+      const secs=d.sections||[{title:'Most Recent',items:d.recent||[]},{title:'Most Popular',items:d.popular||[]}];
+      let h='';
+      secs.forEach(sec=>{
+        const items=(sec.items||[]).map(hcItem).filter(Boolean);
         items.forEach(x=>SEEN.set('hc:'+x.folder+'/'+x.numeric_id,x));
-        h+=row('HentaiCity · '+labels[i],items);
+        h+=row('HentaiCity · '+(sec.title||'Videos'),items);
       });
-      $('#hcrows').innerHTML=h||emptyBox('No items','Seed CDN may be loading — retry.');
-    });
+      $('#hcrows').innerHTML=h||emptyBox('No items','If blocked on server IP, seed titles still stream via CDN.');
+    }).catch(e=>{$('#hcrows').innerHTML=emptyBox('HentaiCity',e.message)});
   };
   paint();
   const g=$('#hcg');
@@ -4989,7 +5103,7 @@ function pgHentaiCity(){
     if(st.busy)return;st.busy=true;g.style.display='';$('#hcrows').style.display='none';g.innerHTML=skelGrid(12).replace('<div class="grid">','').replace(/<\/div>$/,'');
     try{
       const j=await api('/hc/search?q='+enc(q),{ttl:120000});
-      const raw=D(j);const arr=Array.isArray(raw)?raw:(raw.items||[]);
+      const raw=D(j)||{};const arr=Array.isArray(raw)?raw:(raw.items||raw.data||[]);
       const items=arr.map(hcItem).filter(Boolean);
       items.forEach(x=>SEEN.set('hc:'+x.folder+'/'+x.numeric_id,x));
       g.innerHTML=items.map(x=>card(x)).join('')||'<div class="empty" style="grid-column:1/-1"><b>No results</b></div>';
