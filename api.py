@@ -1,4 +1,4 @@
-# StreamHub API v8.1.4 — creator: shawon
+# StreamHub API v8.1.5 — creator: shawon
 from __future__ import annotations
 
 import asyncio, base64, hashlib, hmac, json, random, re, time, uuid
@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
-CREATOR, VERSION = "shawon", "8.1.4"
+CREATOR, VERSION = "shawon", "8.1.5"
 app = FastAPI(title="StreamHub API", version=VERSION, docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -2038,19 +2038,35 @@ async function poll(){
 $('btnCode').onclick=getCode;
 $('btnCopy').onclick=()=>{const v=$('tok').value; if(v)navigator.clipboard.writeText(v)};
 $('btnMe').onclick=async()=>{
-  const t=$('tok').value.trim(); if(!t)return alert('Paste token first');
+  const t=$('tok').value.trim(); if(!t)return alert('Paste full access_token (starts with eyJ…)');
+  if(t.length>1800){alert('Token very long — still trying…');}
   $('out2').style.display='block'; $('out2').textContent='…';
-  try{const r=await fetch('/kt/auth/me?auth='+encodeURIComponent(t)); $('out2').textContent=JSON.stringify(await r.json(),null,2)}
-  catch(e){$('out2').textContent=String(e)}
+  try{
+    const r=await fetch('/kt/auth/me?auth='+encodeURIComponent(t));
+    const text=await r.text();
+    try{$('out2').textContent=JSON.stringify(JSON.parse(text),null,2)}
+    catch(_){$('out2').textContent='HTTP '+r.status+' (non-JSON):\n'+text.slice(0,2000)}
+  }catch(e){$('out2').textContent=String(e)}
 };
 $('btnLogin').onclick=async()=>{
   const u=$('user').value.trim(), p=$('pass').value, ts=$('ts').value.trim();
+  // If only JWT pasted in turnstile box, just validate session
+  if(ts.startsWith('eyJ') && (!u || !p)){
+    $('tok').value=ts; $('btnMe').click(); return;
+  }
+  if(ts.startsWith('eyJ')){
+    alert('That value is an access token (JWT), not a captcha token. Use “Check /kt/auth/me” above instead.');
+    $('tok').value=ts; return;
+  }
   if(!u||!p)return alert('username + password');
   let url='/kt/auth/login?username='+encodeURIComponent(u)+'&password='+encodeURIComponent(p);
   if(ts)url+='&turnstile_token='+encodeURIComponent(ts);
   $('out3').style.display='block'; $('out3').textContent='…';
-  try{const r=await fetch(url); const j=await r.json(); $('out3').textContent=JSON.stringify(j,null,2);
-    if(j.ok&&j.data&&j.data.token)$('tok').value=j.data.token;
+  try{
+    const r=await fetch(url); const text=await r.text();
+    try{const j=JSON.parse(text); $('out3').textContent=JSON.stringify(j,null,2);
+      if(j.ok&&j.data&&j.data.token)$('tok').value=j.data.token;
+    }catch(_){$('out3').textContent='HTTP '+r.status+':\n'+text.slice(0,2000)}
   }catch(e){$('out3').textContent=String(e)}
 };
 </script>
@@ -2101,25 +2117,92 @@ def _kt_extract_session(data: Any) -> dict:
     out["raw"] = data
     return out
 
-@app.get("/kt/auth/me", tags=["Kartoons-Auth"])
-async def kt_auth_me(auth: str = Query(..., description="JWT / Bearer token from kartoons login")):
-    st, data = await _kt_req("GET", "/auth/me", auth=auth)
+def _kt_clean_token(auth: Optional[str]) -> str:
+    if not auth:
+        return ""
+    a = str(auth).strip().strip('"').strip("'")
+    if a.lower().startswith("bearer "):
+        a = a[7:].strip()
+    return a
+
+def _kt_is_jwt(s: Optional[str]) -> bool:
+    if not s or not isinstance(s, str):
+        return False
+    s = s.strip()
+    return s.startswith("eyJ") and s.count(".") >= 2
+
+async def _kt_me_payload(token: str) -> dict:
+    """Always returns JSON-serializable dict — never raises to client as HTML 500."""
+    token = _kt_clean_token(token)
+    if not token:
+        return fail("auth/token required", provider="kartoons", endpoint="auth_me", access="auth")
+    if len(token) < 20:
+        return fail("token too short — paste full access_token JWT", provider="kartoons", endpoint="auth_me")
+    try:
+        st, data = await _kt_req("GET", "/auth/me", auth=token)
+    except Exception as e:
+        return fail(f"upstream error: {e}", provider="kartoons", endpoint="auth_me", access="auth")
     if st < 400 and isinstance(data, dict):
-        sess = _kt_extract_session(data)
-        # merge me payload
         me = data.get("data") if isinstance(data.get("data"), dict) else data
         return ok({
-            "token": auth.replace("Bearer ", "").replace("bearer ", "").strip(),
-            "user": me if isinstance(me, dict) else sess.get("user"),
-            "session": sess,
+            "valid": True,
+            "token": token,
+            "user": me if isinstance(me, dict) else None,
             "raw": data,
+            "how": "Use this token as ?auth=TOKEN on /kt/watchlist, /kt/user/me, /kt/stremio/stream",
         }, provider="kartoons", endpoint="auth_me", access="auth")
-    return _kt_wrap(st, data, "auth_me", "auth")
+    # try user/me as fallback
+    try:
+        st2, data2 = await _kt_req("GET", "/user/me", auth=token)
+        if st2 < 400:
+            me = data2.get("data") if isinstance(data2, dict) and isinstance(data2.get("data"), dict) else data2
+            return ok({
+                "valid": True,
+                "token": token,
+                "user": me,
+                "raw": data2,
+                "source": "user/me",
+            }, provider="kartoons", endpoint="auth_me", access="auth")
+    except Exception:
+        pass
+    msg = data.get("message") if isinstance(data, dict) else f"HTTP {st}"
+    return fail(
+        str(msg) if msg else f"HTTP {st}",
+        provider="kartoons", endpoint="auth_me", access="auth", status=st,
+        valid=False, token_preview=token[:20] + "…",
+        how="Token invalid/expired. Get a new one via /kt/device/code → device status (not turnstile field).",
+        data=data if isinstance(data, dict) else {"raw": str(data)[:500]},
+    )
+
+@app.get("/kt/auth/me", tags=["Kartoons-Auth"])
+async def kt_auth_me(auth: str = Query(..., description="JWT access_token from device login or kartoons — NOT turnstile")):
+    return await _kt_me_payload(auth)
+
+@app.post("/kt/auth/me", tags=["Kartoons-Auth"])
+async def kt_auth_me_post(auth: str = Query(None), token: str = Query(None)):
+    """Same as GET — prefer this if JWT is very long for URL limits."""
+    return await _kt_me_payload(auth or token or "")
 
 async def _kt_do_login(username: str, password: str, turnstile_token: Optional[str] = None):
     """Upstream expects username + password; CAPTCHA often required."""
+    # User often pastes access_token JWT into turnstile field by mistake
+    if _kt_is_jwt(turnstile_token) and not password:
+        return await _kt_me_payload(turnstile_token)
+    if _kt_is_jwt(turnstile_token) and password:
+        # still try login without misusing JWT as captcha; first validate JWT
+        me = await _kt_me_payload(turnstile_token)
+        if me.get("ok"):
+            return ok({
+                "logged_in": True,
+                "token": _kt_clean_token(turnstile_token),
+                "user": (me.get("data") or {}).get("user"),
+                "note": "turnstile_token looked like JWT access_token — used as session token (captcha not needed)",
+                "how": "You already had a login token. Do not put JWT in turnstile field.",
+            }, provider="kartoons", endpoint="auth_login", access="auth")
+        # JWT invalid — fall through to password login without sending JWT as captcha
+        turnstile_token = None
     body = {"username": username, "password": password}
-    if turnstile_token:
+    if turnstile_token and not _kt_is_jwt(turnstile_token):
         body["turnstile_token"] = turnstile_token
         body["cf-turnstile-response"] = turnstile_token
     st, data = await _kt_req("POST", "/auth/login", json_body=body)
@@ -2497,7 +2580,7 @@ footer{text-align:center;color:var(--mu);font-size:12px;padding:20px 0 10px}
 </head>
 <body>
 <header class="top">
-  <div class="brand"><div class="logo">SH</div><div><h1>StreamHub API</h1><small>v8.1.4 · creator: shawon</small></div></div>
+  <div class="brand"><div class="logo">SH</div><div><h1>StreamHub API</h1><small>v8.1.5 · creator: shawon</small></div></div>
   <div class="search"><span style="opacity:.4;font-size:13px">⌕</span><input id="q" placeholder="Filter endpoints…" oninput="filt()"/></div>
 </header>
 <div class="tabs" id="tabs"></div>
