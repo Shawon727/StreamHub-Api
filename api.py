@@ -1,4 +1,4 @@
-# StreamHub API v8.1.2 — creator: shawon
+# StreamHub API v8.1.3 — creator: shawon
 from __future__ import annotations
 
 import asyncio, base64, hashlib, hmac, json, random, re, time, uuid
@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
-CREATOR, VERSION = "shawon", "8.1.2"
+CREATOR, VERSION = "shawon", "8.1.3"
 app = FastAPI(title="StreamHub API", version=VERSION, docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -1904,15 +1904,134 @@ async def kt_suggestions_episode(episode_id: str):
     return _kt_wrap(st, data, "suggestions_episode", "challenge")
 
 # ---- Auth required (pass ?auth=TOKEN or Authorization header via auth query) ----
+
+KT_TURNSTILE_SITEKEY = "0x4AAAAAAFMBI3Lp3ohSsfYm"  # from kartoons.to main bundle
+
+@app.get("/kt/captcha", tags=["Kartoons-Challenge"])
+async def kt_captcha_info():
+    """How to get turnstile_token + sitekey for login/stream."""
+    return ok({
+        "sitekey": KT_TURNSTILE_SITEKEY,
+        "widget_page": "/kt/captcha/widget",
+        "script": "https://challenges.cloudflare.com/turnstile/v0/api.js",
+        "login_body": {"username": "your_user_or_email", "password": "***", "turnstile_token": "<from widget>"},
+        "steps": [
+            "1. Open /kt/captcha/widget on this API host (browser).",
+            "2. Complete Cloudflare checkbox/puzzle → token appears.",
+            "3. Copy token into /kt/auth/login?username=...&password=...&turnstile_token=TOKEN",
+            "4. Or use captcha-free device login: /kt/device/code → phone link → /kt/device/status?code=",
+        ],
+        "note": "Turnstile tokens are single-use and expire in ~5 minutes. Server cannot solve captcha without a browser.",
+        "device_login_no_captcha": {
+            "step1": "GET /kt/device/code",
+            "step2": "Open link_url on phone, enter code (while logged into kartoons.to)",
+            "step3": "GET /kt/device/status?code=YOUR_CODE until token JSON",
+        },
+    }, provider="kartoons", endpoint="captcha_info", access="public")
+
+KT_CAPTCHA_HTML = """<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Kartoons Turnstile — StreamHub</title>
+<style>
+body{font-family:system-ui,sans-serif;background:#0a0a0c;color:#f4f4f5;min-height:100vh;display:flex;align-items:center;justify-content:center;margin:0;padding:16px}
+.card{background:#141418;border:1px solid #2a2a32;border-radius:16px;padding:24px;max-width:420px;width:100%;box-shadow:0 20px 50px #0008}
+h1{font-size:18px;margin:0 0 8px}p{color:#9ca3af;font-size:13px;line-height:1.5;margin:0 0 16px}
+#box{display:flex;justify-content:center;margin:16px 0;min-height:70px}
+pre{background:#050506;border:1px solid #2a2a32;border-radius:10px;padding:12px;font-size:11px;word-break:break-all;white-space:pre-wrap;max-height:140px;overflow:auto}
+.row{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
+button,.btn{background:linear-gradient(135deg,#8b5cf6,#6d28d9);border:0;color:#fff;padding:10px 14px;border-radius:8px;font-weight:600;font-size:13px;cursor:pointer;text-decoration:none;display:inline-block}
+.ghost{background:transparent;border:1px solid #2a2a32;color:#e4e4e7}
+.ok{color:#34d399;font-size:12px;margin-top:8px}
+input{width:100%;box-sizing:border-box;background:#0a0a0c;border:1px solid #2a2a32;border-radius:8px;padding:10px;color:#fff;margin-top:8px}
+label{font-size:11px;color:#9ca3af}
+</style>
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+</head><body>
+<div class="card">
+  <h1>Cloudflare Turnstile</h1>
+  <p>Complete the check below. Token is used for <b>/kt/auth/login</b> and stream links. Tokens expire quickly — use within ~5 minutes.</p>
+  <div id="box"><div class="cf-turnstile" data-sitekey="SITEKEY" data-callback="onTs" data-theme="dark"></div></div>
+  <div id="status" class="ok">Waiting for captcha…</div>
+  <label>turnstile_token</label>
+  <pre id="tok">—</pre>
+  <div class="row">
+    <button type="button" onclick="copyTok()">Copy token</button>
+    <a class="btn ghost" id="loginLink" href="#">Open login URL</a>
+  </div>
+  <label style="display:block;margin-top:16px">Optional: username</label>
+  <input id="user" placeholder="email or username"/>
+  <label style="display:block;margin-top:8px">password</label>
+  <input id="pass" type="password" placeholder="password"/>
+  <div class="row"><button type="button" onclick="doLogin()">Login via API</button></div>
+  <pre id="out" style="margin-top:12px;display:none"></pre>
+</div>
+<script>
+const SITEKEY="SITEKEY";
+let TOKEN="";
+function onTs(t){
+  TOKEN=t; document.getElementById('tok').textContent=t;
+  document.getElementById('status').textContent='Token ready — copy or login below';
+  buildLogin();
+}
+function copyTok(){if(!TOKEN)return;navigator.clipboard.writeText(TOKEN)}
+function buildLogin(){
+  const u=document.getElementById('user').value.trim();
+  const p=document.getElementById('pass').value;
+  let href='/kt/auth/login?turnstile_token='+encodeURIComponent(TOKEN);
+  if(u)href+='&username='+encodeURIComponent(u);
+  if(p)href+='&password='+encodeURIComponent(p);
+  document.getElementById('loginLink').href=href;
+}
+document.getElementById('user').oninput=buildLogin;
+document.getElementById('pass').oninput=buildLogin;
+async function doLogin(){
+  if(!TOKEN){alert('Complete captcha first');return}
+  const u=document.getElementById('user').value.trim();
+  const p=document.getElementById('pass').value;
+  if(!u||!p){alert('Enter username and password');return}
+  const url='/kt/auth/login?username='+encodeURIComponent(u)+'&password='+encodeURIComponent(p)+'&turnstile_token='+encodeURIComponent(TOKEN);
+  const out=document.getElementById('out'); out.style.display='block'; out.textContent='Loading…';
+  try{
+    const r=await fetch(url); const j=await r.json();
+    out.textContent=JSON.stringify(j,null,2);
+    if(j.ok&&(j.data&&j.data.token||j.token)){
+      const tok=(j.data&&j.data.token)||j.token;
+      out.textContent=JSON.stringify(j,null,2)+'\\n\\n// saved tip: use ?auth='+tok;
+    }
+  }catch(e){out.textContent=String(e)}
+}
+</script>
+</body></html>
+""".replace("SITEKEY", KT_TURNSTILE_SITEKEY)
+
+@app.get("/kt/captcha/widget", response_class=HTMLResponse, tags=["Kartoons-Challenge"])
+async def kt_captcha_widget():
+    """Browser page: solve Turnstile → copy token or login with username/password."""
+    return HTMLResponse(KT_CAPTCHA_HTML, headers={"Cache-Control": "no-store"})
+
+
 def _kt_extract_session(data: Any) -> dict:
     """Normalize login/device-link response → token + user JSON."""
     if not isinstance(data, dict):
         return {"raw": data}
     root = data.get("data") if isinstance(data.get("data"), dict) else data
     token = (
-        root.get("token") or root.get("access_token") or root.get("accessToken")
-        or root.get("jwt") or root.get("authToken") or data.get("token")
+        root.get("access_token") or root.get("accessToken") or root.get("token")
+        or root.get("jwt") or root.get("authToken") or data.get("access_token") or data.get("token")
     )
+    # nested data.data (kartoons login shape)
+    if not token and isinstance(root.get("data"), dict):
+        inner = root["data"]
+        token = inner.get("access_token") or inner.get("token")
+        if not user:
+            user = inner.get("user")
+    if not token and isinstance(data.get("data"), dict):
+        inner = data["data"]
+        if isinstance(inner.get("data"), dict):
+            inner = inner["data"]
+        token = token or inner.get("access_token") or inner.get("token")
+        user = user or inner.get("user")
     user = root.get("user") or root.get("account") or root.get("profile") or root.get("me")
     # sometimes user fields flat
     if not user and root.get("username"):
@@ -2327,7 +2446,7 @@ footer{text-align:center;color:var(--mu);font-size:12px;padding:20px 0 10px}
 </head>
 <body>
 <header class="top">
-  <div class="brand"><div class="logo">SH</div><div><h1>StreamHub API</h1><small>v8.1.2 · creator: shawon</small></div></div>
+  <div class="brand"><div class="logo">SH</div><div><h1>StreamHub API</h1><small>v8.1.3 · creator: shawon</small></div></div>
   <div class="search"><span style="opacity:.4;font-size:13px">⌕</span><input id="q" placeholder="Filter endpoints…" oninput="filt()"/></div>
 </header>
 <div class="tabs" id="tabs"></div>
@@ -2411,6 +2530,8 @@ const E = [
 {g:'Kartoons',p:'/kt/community/posts',how:'CHALLENGE: community posts.',params:[]},
 {g:'Kartoons',p:'/kt/collections',how:'CHALLENGE: collections list.',params:[]},
 {g:'Kartoons',p:'/kt/suggestions/episode/{episode_id}',how:'CHALLENGE: related episode suggestions.',params:[{n:'episode_id',v:'6867877f57ee07b9b7401910',path:true}]},
+{g:'Kartoons',p:'/kt/captcha',how:'How to get turnstile_token + sitekey. Open /kt/captcha/widget in browser.',params:[]},
+{g:'Kartoons',p:'/kt/captcha/widget',how:'HTML page with Cloudflare widget. Solve → copy token → login.',params:[]},
 {g:'Kartoons',p:'/kt/auth/login',how:'AUTH login (GET+POST). Returns token+user JSON. Upstream often needs turnstile_token. No captcha? Use /kt/device/code instead.',params:[{n:'username',v:''},{n:'password',v:''},{n:'turnstile_token',v:''}]},
 {g:'Kartoons',p:'/kt/auth/me',how:'AUTH: current user. Requires auth= token.',params:[{n:'auth',v:''}]},
 {g:'Kartoons',p:'/kt/user/me',how:'AUTH: user profile.',params:[{n:'auth',v:''}]},
