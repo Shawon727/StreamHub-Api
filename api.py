@@ -1,17 +1,17 @@
-# StreamHub API v8.1.7 — creator: shawon
+# StreamHub API v8.2.1 — creator: shawon
 from __future__ import annotations
 
-import asyncio, base64, hashlib, hmac, json, random, re, time, uuid
+import asyncio, base64, gzip, hashlib, hmac, json, random, re, time, uuid
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qsl, urljoin, urlparse, quote
 
 import httpx
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response, StreamingResponse, PlainTextResponse
 
-CREATOR, VERSION = "shawon", "8.1.7"
+CREATOR, VERSION = "shawon", "8.2.1"
 app = FastAPI(title="StreamHub API", version=VERSION, docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -154,6 +154,146 @@ def _dash_from_cookie(sign_cookie):
         "cookie": cookie, "base": base, "note": "Send Cookie header when playing",
     }
 
+
+def _mb_dash_token(base: str, cookie: str) -> str:
+    """b64url token for /px/{token}/… proxy."""
+    payload = json.dumps({"b": base.rstrip("/"), "c": cookie or ""}, separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(payload).decode().rstrip("=")
+
+def _mb_proxy_mpd_url(base: str, cookie: str) -> str:
+    tok = _mb_dash_token(base, cookie)
+    return f"/px/{tok}/index.mpd"
+
+def _xml_local(tag: str) -> str:
+    if not tag:
+        return ""
+    return tag.split("}")[-1] if "}" in tag else tag
+
+def _parse_mpd_reps(mpd_xml: str, base: str, cookie: str) -> list:
+    """Parse DASH MPD → list of representations with cookie-free play_url (via /px proxy)."""
+    import xml.etree.ElementTree as ET
+    out = []
+    try:
+        root = ET.fromstring(mpd_xml)
+    except Exception:
+        return out
+    base = (base or "").rstrip("/")
+    tok = _mb_dash_token(base, cookie) if base else ""
+
+    def abs_url(u: str) -> str:
+        if not u:
+            return ""
+        if u.startswith("http"):
+            return u
+        if u.startswith("/"):
+            # host from base
+            try:
+                from urllib.parse import urlparse as _up
+                p = _up(base)
+                return f"{p.scheme}://{p.netloc}{u}"
+            except Exception:
+                return base + u
+        return base + "/" + u.lstrip("/")
+
+    def proxy(u: str) -> str:
+        if not u or not tok:
+            return u
+        # relative to base for /px
+        if base and u.startswith(base):
+            rel = u[len(base):].lstrip("/")
+        else:
+            rel = u
+            if "://" in u:
+                # full URL different host — still try path only
+                try:
+                    from urllib.parse import urlparse as _up
+                    rel = _up(u).path.lstrip("/")
+                except Exception:
+                    rel = u
+        return f"/px/{tok}/{rel}"
+
+    for period in root.iter():
+        if _xml_local(period.tag) != "Period":
+            continue
+        for aset in period:
+            if _xml_local(aset.tag) != "AdaptationSet":
+                continue
+            content_type = aset.attrib.get("contentType") or aset.attrib.get("mimeType") or ""
+            for rep in aset:
+                if _xml_local(rep.tag) != "Representation":
+                    continue
+                rid = rep.attrib.get("id") or ""
+                bw = rep.attrib.get("bandwidth")
+                w = rep.attrib.get("width")
+                h = rep.attrib.get("height")
+                codecs = rep.attrib.get("codecs") or ""
+                mime = rep.attrib.get("mimeType") or content_type or ""
+                # BaseURL under rep or adaptation
+                base_url = ""
+                for child in list(rep) + list(aset):
+                    if _xml_local(child.tag) == "BaseURL" and child.text:
+                        base_url = abs_url(child.text.strip())
+                        break
+                # SegmentTemplate
+                media_tmpl = init_tmpl = None
+                timescale = None
+                for child in list(rep) + list(aset):
+                    if _xml_local(child.tag) == "SegmentTemplate":
+                        media_tmpl = child.attrib.get("media")
+                        init_tmpl = child.attrib.get("initialization")
+                        timescale = child.attrib.get("timescale")
+                        break
+                quality = f"{h}p" if h else (f"{int(bw)//1000}k" if bw else rid or "auto")
+                kind = "video" if ("video" in (mime or "").lower() or h) else ("audio" if "audio" in (mime or "").lower() else "stream")
+                item = {
+                    "id": rid,
+                    "quality": quality,
+                    "width": int(w) if w and str(w).isdigit() else None,
+                    "height": int(h) if h and str(h).isdigit() else None,
+                    "bandwidth": int(bw) if bw and str(bw).isdigit() else None,
+                    "codecs": codecs,
+                    "mime": mime,
+                    "kind": kind,
+                    "base_url": base_url or None,
+                }
+                if init_tmpl:
+                    init_u = abs_url(init_tmpl.replace("$RepresentationID$", rid).replace("$Bandwidth$", str(bw or "")))
+                    item["init_segment"] = init_u
+                    item["init_play"] = proxy(init_u)
+                if media_tmpl:
+                    item["media_template"] = media_tmpl
+                # Full MPD play via proxy — works without client cookie
+                item["play_url"] = f"/px/{tok}/index.mpd" if tok else None
+                item["play_absolute_hint"] = "Prefix with your API origin. dash.js / VLC open play_url — cookie injected by server."
+                out.append(item)
+    # de-dupe by id+bandwidth
+    seen = set()
+    uniq = []
+    for x in out:
+        k = (x.get("id"), x.get("bandwidth"), x.get("height"))
+        if k in seen:
+            continue
+        seen.add(k)
+        uniq.append(x)
+    # video first higher quality
+    uniq.sort(key=lambda x: (0 if x.get("kind") == "video" else 1, -(x.get("height") or 0), -(x.get("bandwidth") or 0)))
+    return uniq
+
+async def _mb_fetch_mpd(base: str, cookie: str) -> str:
+    mpd_url = base.rstrip("/") + "/index.mpd"
+    headers = {
+        "User-Agent": UA,
+        "Accept": "application/dash+xml,application/xml,*/*",
+        "Referer": "https://www.moviebox.ph/",
+    }
+    if cookie:
+        headers["Cookie"] = cookie if "Edge-Cache-Cookie" in cookie else f"Edge-Cache-Cookie={cookie}"
+    async with _client(25.0) as client:
+        r = await client.get(mpd_url, headers=headers)
+        if r.status_code >= 400:
+            raise HTTPException(502, detail=fail("MPD fetch failed", status=r.status_code, url=mpd_url))
+        return r.text
+
 def _mb_streams(payload):
     streams = []
     data = _mb_unwrap(payload)
@@ -280,12 +420,123 @@ async def mb_play(subject_id: str, se: Optional[int] = None, ep: Optional[int] =
     data = await _mb_request("GET", path, token=tok)
     inner = _mb_unwrap(data)
     streams = _mb_streams(data)
+    # Attach cookie-free play_url under each dash stream (extractor)
+    enriched = []
+    for s in streams:
+        s2 = dict(s)
+        if s2.get("kind") == "dash" and s2.get("base"):
+            s2["play_url"] = _mb_proxy_mpd_url(s2["base"], s2.get("cookie") or "")
+            s2["cookie_required_on_client"] = False
+            s2["dash_extractor"] = {
+                "play_url": s2["play_url"],
+                "note": "Use play_url on API host — server injects Edge-Cache-Cookie. Client plays without cookie.",
+            }
+        elif s2.get("kind") == "mp4" or s2.get("url"):
+            s2["play_url"] = s2.get("url")
+            s2["cookie_required_on_client"] = False
+        enriched.append(s2)
     return ok({
         "subject_id": subject_id, "season": se, "episode": ep, "title": inner.get("title"),
-        "streams": streams, "count": len(streams), "displayResolutions": inner.get("displayResolutions"),
+        "streams": enriched, "count": len(enriched), "displayResolutions": inner.get("displayResolutions"),
+        "dash_extractor": [x for x in enriched if x.get("kind") == "dash"],
     }, provider="moviebox", level="primary", endpoint="play",
-       note="kind=dash needs Cookie header; kind=mp4 is direct URL")
+       note="dash: use play_url (proxied, no client cookie). mp4: direct url.")
 
+
+
+@app.get("/mb/dash/extract", tags=["MovieBox"])
+async def mb_dash_extract(
+    subject_id: str = Query(..., description="MovieBox subjectId"),
+    se: Optional[int] = None,
+    ep: Optional[int] = None,
+    mpd: Optional[str] = Query(None, description="Optional direct MPD URL"),
+    cookie: Optional[str] = Query(None, description="Edge-Cache-Cookie if mpd given"),
+    base: Optional[str] = Query(None, description="CDN base urlprefix decoded"),
+):
+    """
+    DASH link extractor — parses MPD representations and returns **cookie-free play_url**
+    (server-side /px proxy injects Edge-Cache-Cookie). Use play_url in dash.js / VLC.
+    Also returns each quality track from the MPD.
+    """
+    streams_out = []
+    title = None
+    if subject_id and not mpd:
+        tok = await _mb_session()
+        if se is not None and ep is not None:
+            path = f"/wefeed-mobile-bff/subject-api/play-info/v2?subjectId={subject_id}&se={se}&ep={ep}"
+        else:
+            path = f"/wefeed-mobile-bff/subject-api/play-info/v2?subjectId={subject_id}"
+        data = await _mb_request("GET", path, token=tok)
+        inner = _mb_unwrap(data)
+        title = inner.get("title")
+        for s in _mb_streams(data):
+            if s.get("kind") != "dash":
+                # still list mp4 as already-direct
+                streams_out.append({
+                    "source": "mp4",
+                    "quality": s.get("quality"),
+                    "url": s.get("url"),
+                    "play_url": s.get("url"),
+                    "kind": "mp4",
+                    "codec": s.get("codec"),
+                    "cookie_required": False,
+                })
+                continue
+            b = s.get("base") or ""
+            c = s.get("cookie") or ""
+            try:
+                xml = await _mb_fetch_mpd(b, c)
+                reps = _parse_mpd_reps(xml, b, c)
+            except Exception as e:
+                reps = []
+                xml_err = str(e)
+            else:
+                xml_err = None
+            streams_out.append({
+                "source": "dash",
+                "quality": s.get("quality"),
+                "codec": s.get("codec"),
+                "mpd": s.get("url"),
+                "base": b,
+                "cookie_required_on_client": False,
+                "play_url": _mb_proxy_mpd_url(b, c),
+                "play_how": "Open play_url on THIS API host (relative /px/...). Server adds cookie. Client needs NO cookie.",
+                "representations": reps,
+                "representation_count": len(reps),
+                "error": xml_err,
+            })
+    elif mpd or base:
+        b = (base or "").rstrip("/")
+        if not b and mpd:
+            b = mpd.replace("/index.mpd", "").rstrip("/")
+        c = cookie or ""
+        if c and not c.startswith("Edge-Cache-Cookie"):
+            c = f"Edge-Cache-Cookie={c}"
+        xml = await _mb_fetch_mpd(b, c)
+        reps = _parse_mpd_reps(xml, b, c)
+        streams_out.append({
+            "source": "dash",
+            "mpd": b + "/index.mpd",
+            "base": b,
+            "play_url": _mb_proxy_mpd_url(b, c),
+            "cookie_required_on_client": False,
+            "representations": reps,
+            "representation_count": len(reps),
+        })
+    else:
+        return fail("subject_id or mpd/base required", provider="moviebox", endpoint="dash_extract")
+
+    return ok({
+        "subject_id": subject_id,
+        "title": title,
+        "dash_extractor": streams_out,
+        "count": len(streams_out),
+        "how": "Use dash_extractor[].play_url — full URL = https://YOUR-API-HOST + play_url. No client Cookie header needed.",
+    }, provider="moviebox", level="primary", endpoint="dash_extract")
+
+@app.get("/mb/dash/extract/{subject_id}", tags=["MovieBox"])
+async def mb_dash_extract_path(subject_id: str, se: Optional[int] = None, ep: Optional[int] = None):
+    return await mb_dash_extract(subject_id=subject_id, se=se, ep=ep)
 
 @app.get("/mb/cdn/{subject_id}", tags=["MovieBox"])
 async def mb_cdn(subject_id: str, se: Optional[int] = None, ep: Optional[int] = None):
@@ -2766,7 +3017,7 @@ footer{text-align:center;color:var(--mu);font-size:12px;padding:20px 0 10px}
 </head>
 <body>
 <header class="top">
-  <div class="brand"><div class="logo">SH</div><div><h1>StreamHub API</h1><small>v8.1.7 · creator: shawon</small></div></div>
+  <div class="brand"><div class="logo">SH</div><div><h1>StreamHub API</h1><small>v8.2.1 · creator: shawon</small></div></div>
   <div class="search"><span style="opacity:.4;font-size:13px">⌕</span><input id="q" placeholder="Filter endpoints…" oninput="filt()"/></div>
 </header>
 <div class="tabs" id="tabs"></div>
@@ -2787,7 +3038,8 @@ const E = [
 {g:'MovieBox',p:'/mb/tab/{tab_id}',how:'Raw tab feed.',params:[{n:'tab_id',v:'1',path:true},{n:'page',v:'1'}]},
 {g:'MovieBox',p:'/mb/detail/{id}',how:'Full metadata for subjectId.',params:[{n:'id',v:'1654274595068805784',path:true}]},
 {g:'MovieBox',p:'/mb/seasons/{id}',how:'Season list for series.',params:[{n:'id',v:'1654274595068805784',path:true}]},
-{g:'MovieBox',p:'/mb/play/{id}',how:'MP4 + DASH streams. DASH needs Cookie header.',params:[{n:'id',v:'1654274595068805784',path:true},{n:'se',v:''},{n:'ep',v:''}]},
+{g:'MovieBox',p:'/mb/play/{id}',how:'MP4 + DASH. Each dash has play_url (cookie-free via /px proxy).',params:[{n:'id',v:'1654274595068805784',path:true},{n:'se',v:''},{n:'ep',v:''}]},
+{g:'MovieBox',p:'/mb/dash/extract',how:'DASH extractor: parse MPD reps + cookie-free play_url for every quality.',params:[{n:'subject_id',v:'1654274595068805784'},{n:'se',v:''},{n:'ep',v:''}]},
 {g:'MovieBox',p:'/mb/cdn/{id}',how:'All MP4 + DASH CDN (play + resource).',params:[{n:'id',v:'1654274595068805784',path:true}]},
 {g:'MovieBox',p:'/mb/mp4/{id}',how:'Only direct MP4 CDN URLs.',params:[{n:'id',v:'1654274595068805784',path:true}]},
 {g:'MovieBox',p:'/mb/resource/{id}',how:'Extra resource/download links.',params:[{n:'id',v:'1654274595068805784',path:true}]},
@@ -3577,6 +3829,23 @@ html[data-size=l] .grid{grid-template-columns:repeat(auto-fill,minmax(150px,1fr)
 /* detail backdrop: blur only where the GPU can afford it */
 #dbg{filter:none;opacity:.2;transform:none}
 @media(min-width:900px){html:not(.lite) #dbg{filter:blur(40px) saturate(1.3);opacity:.32;transform:scale(1.2)}}
+
+
+.trbadge{position:absolute;left:8px;bottom:8px;z-index:3;font:700 9px/1 var(--ff);letter-spacing:.04em;padding:5px 7px;border-radius:8px;background:rgba(0,0,0,.72);color:#fff;backdrop-filter:blur(6px);opacity:.9;pointer-events:none}
+.poster.trailer-on video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;z-index:2;border-radius:inherit}
+.poster.trailer-on img{opacity:0}
+.poster.trailer-on .trbadge{background:var(--flare,#ff4f78)}
+.hc-q{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}
+.hc-q button{padding:8px 12px;border-radius:12px;border:1px solid var(--line);background:var(--panel);color:var(--txt);font-weight:700;font-size:12px}
+.hc-q button.on{background:linear-gradient(135deg,var(--a1),var(--a2));border-color:transparent;color:#fff}
+/* v8.2 futuristic polish */
+@keyframes aurora{0%{background-position:0% 50%}50%{background-position:100% 50%}100%{background-position:0% 50%}}
+@keyframes floaty{0%,100%{transform:translateY(0)}50%{transform:translateY(-6px)}}
+@keyframes glowPulse{0%,100%{box-shadow:0 0 0 0 rgba(94,139,255,.35)}50%{box-shadow:0 0 24px 2px rgba(94,139,255,.25)}}
+.hero-aurora{background:linear-gradient(120deg,#5e8bff33,#ff4f7833,#37e6b033,#5e8bff33);background-size:300% 300%;animation:aurora 12s ease infinite}
+.card:hover{transform:translateY(-4px) scale(1.02);transition:transform .35s cubic-bezier(.2,.8,.2,1),box-shadow .35s}
+.btn.pri{animation:glowPulse 3.5s ease-in-out infinite}
+.dock{backdrop-filter:blur(18px) saturate(1.4)}
 </style>
 </head>
 <body>
@@ -3730,8 +3999,21 @@ function mbSeasons(data){
 function mbStreams(cdn){
   const out=[];const d=cdn||{};
   (d.mp4||[]).forEach(m=>{if(!m.url)return;const k=/\.(mp4|m4v|webm)(\?|$)/i.test(m.url)||m.kind==='mp4'?'mp4':(/\.m3u8/i.test(m.url)?'hls':'file');
-    out.push({kind:k,url:m.url,quality:m.quality,q:qNum(m.quality),size:m.size,codec:m.codec,label:'MP4',source:m.source||'play',dl:true,cookie:m.cookie||''})});
-  (d.dash||[]).forEach(m=>{if(!m.base&&!m.url)return;out.push({kind:'dash',url:m.url,base:m.base,cookie:m.cookie,quality:m.quality,q:qNum(m.quality),size:m.size,codec:m.codec,label:'DASH',dl:false})});
+    out.push({kind:k,url:m.url,play_url:m.play_url||m.url,quality:m.quality,q:qNum(m.quality),size:m.size,codec:m.codec,label:'MP4',source:m.source||'play',dl:true,cookie:m.cookie||''})});
+  // prefer dash_extractor / streams from play API
+  const dashList=(d.dash_extractor||d.dash||[]).concat((d.streams||[]).filter(x=>x&&x.kind==='dash'));
+  dashList.forEach(m=>{
+    if(!m.base&&!m.url&&!m.play_url)return;
+    const play=m.play_url||(m.base?dashProxyUrl(m.base,m.cookie):null);
+    out.push({kind:'dash',url:m.url||m.mpd,base:m.base,cookie:m.cookie,play_url:play,quality:m.quality,q:qNum(m.quality),size:m.size,codec:m.codec,label:'DASH · no cookie',dl:false,reps:m.representations||m.dash_extractor&&m.representations});
+  });
+  // pure mp4 from streams
+  (d.streams||[]).filter(x=>x&&x.kind!=='dash'&&x.url).forEach(m=>{
+    if(out.some(o=>o.url===m.url))return;
+    out.push({kind:'mp4',url:m.url,play_url:m.play_url||m.url,quality:m.quality,q:qNum(m.quality),size:m.size,codec:m.codec,label:'MP4',source:'play',dl:true});
+  });
+  // mp4 first, then dash by quality
+  out.sort((a,b)=>(a.kind==='mp4'||a.kind==='hls'?0:1)-(b.kind==='mp4'||b.kind==='hls'?0:1)||(b.q-a.q));
   return out;
 }
 /* ---- HindiAnime ---- */
@@ -3791,12 +4073,23 @@ function hrefOf(it){
     case'ha':return it.id?'#/ha/'+enc(it.id):'#/hau/'+enc(it.link);
     case'fk':return'#/fk/'+enc(it.id);
     case'dr':return'#/dr/'+enc(it.id)+'/'+enc(it.content||'movies');
+    case'hc':return'#/hc/'+enc(it.folder||'')+'/'+enc(it.numeric_id||it.vid||it.id||'');
   }return'#/home';
 }
 function extIntent(url){
   try{const u=new URL(url);return'intent:'+url.replace(/^https?:\/\//,'')+'#Intent;scheme='+u.protocol.replace(':','')+';type=video/*;end'}catch(e){return url}
 }
 function b64u(s){return btoa(unescape(encodeURIComponent(s))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'')}
+function hcItem(a){
+  if(!a||typeof a!=='object')return null;
+  const folder=a.folder||(a.streams&&a.streams.folder);
+  const vid=a.numeric_id||a.video_id||a.vid||(a.streams&&a.streams.video_id);
+  const streams=a.streams||(folder&&vid?null:null);
+  const tr=(streams&&streams.trailer)||a.trailer||(folder&&vid?('https://cdn1.hentaicity.com/'+folder+'/'+vid+'/trailer.mp4'):'');
+  const poster=a.poster||(streams&&streams.poster)||(folder&&vid?('https://cdn1.images.hentaicity.com/videos/'+folder+'/'+vid+'/main.jpg'):'');
+  if(!folder||!vid)return null;
+  return{provider:'hc',id:String(a.id||(folder+'-'+vid)),folder:String(folder),numeric_id:String(vid),title:String(a.title||'Video'),poster,trailer:tr,streams:streams||null,type:'movie',genre:'HentaiCity',_adult:1};
+}
 function dashProxyUrl(base,cookie){return'/px/'+b64u(JSON.stringify({b:base,c:cookie||''}))+'/index.mpd'}
 function gxUrl(u,extra){return'/gx?u='+enc(u)+(extra&&extra.cookie?'&c='+enc(extra.cookie):'')}
 if(typeof module!=='undefined')module.exports={mbSubj,mbSections,mbDetail,mbSeasons,mbStreams,haItem,genericSections,haEpisodes,haServers,fkItem,drItem,hrefOf,dashProxyUrl,gxUrl,qNum,fmtSize,fmtTime,extIntent,b64u,humanize};
@@ -3916,6 +4209,7 @@ class Player{
     this._chips();
   }
   _url(s){
+    if(s.play_url)return s.play_url.startsWith('http')?s.play_url:(s.play_url.startsWith('/')?s.play_url:('/'+s.play_url));
     if(s.kind==='dash')return dashProxyUrl(s.base||String(s.url||'').replace(/\/index\.mpd.*$/,''),s.cookie);
     if(s.proxied)return gxUrl(s.url,{cookie:s.cookie});
     return s.url;
@@ -4011,6 +4305,7 @@ class Player{
   }
   _extUrl(){
     const s=this.sources[this.idx];if(!s)return '';
+    if(s.play_url){const p=s.play_url;return p.startsWith('http')?p:(location.origin+(p.startsWith('/')?p:'/'+p));}
     if(s.kind==='dash')return location.origin+dashProxyUrl(s.base||String(s.url||'').replace(/\/index\.mpd.*$/,''),s.cookie);
     return s.proxied?location.origin+gxUrl(s.url,{cookie:s.cookie}):s.url;
   }
@@ -4236,17 +4531,18 @@ function imgErr(i){const p=i.parentElement;i.remove();p.classList.add('noimg')}
 function imgOk(i){i.classList.add('ld')}
 function poster(it,extra){
   const t=(it.title||'?').trim().charAt(0).toUpperCase();
-  return'<div class="poster'+(it.poster?'':' noimg')+'" data-t="'+esc(t)+'">'+(it.poster?'<img loading="lazy" decoding="async" referrerpolicy="no-referrer" alt="" src="'+esc(it.poster)+'" onload="imgOk(this)" onerror="imgErr(this)">':'')+'<span class="shine"></span><span class="pp">'+ico('play')+'</span>'+(extra||'')+'</div>';
+  const tr=it.trailer||(it.streams&&it.streams.trailer)||'';
+  return'<div class="poster'+(it.poster?'':' noimg')+'" data-t="'+esc(t)+'"'+(tr?' data-trailer="'+esc(tr)+'"':'')+'>'+(it.poster?'<img loading="lazy" decoding="async" referrerpolicy="no-referrer" alt="" src="'+esc(it.poster)+'" onload="imgOk(this)" onerror="imgErr(this)">':'')+'<span class="shine"></span><span class="pp">'+ico('play')+'</span>'+(tr?'<span class="trbadge">HOLD · TRAILER</span>':'')+(extra||'')+'</div>';
 }
 function card(it,opts){
   opts=opts||{};
   let ex='';
   if(it.rating)ex+='<b class="rt">★ '+esc(it.rating)+'</b>';
-  if(it.quality==='4K')ex+='<span class="bd k">4K</span>';else if(it.type==='series'&&!opts.noBadge)ex+='<span class="bd">SERIES</span>';
+  if(it.quality==='4K')ex+='<span class="bd k">4K</span>';else if(it.provider==='hc')ex+='<span class="bd" style="background:#ff4f78">HC</span>';else if(it.type==='series'&&!opts.noBadge)ex+='<span class="bd">SERIES</span>';
   if(opts.progress)ex+='<div class="pg-bar"><i style="width:'+Math.min(100,opts.progress)+'%"></i></div>';
   if(opts.num)ex+='<span class="num">'+opts.num+'</span>';
   const meta=[it.year,(it.genre||'').split(',')[0],it.ep].filter(Boolean).join(' • ');
-  return'<a class="card" data-rv href="'+hrefOf(it)+'">'+poster(it,ex)+'<div class="ct"><h3>'+esc(it.title)+'</h3><p>'+esc(meta||(it.type==='series'?'Series':'Movie'))+'</p></div></a>';
+  return'<a class="card" data-rv href="'+hrefOf(it)+'" data-provider="'+esc(it.provider||'')+'">'+poster(it,ex)+'<div class="ct"><h3>'+esc(it.title)+'</h3><p>'+esc(meta||(it.provider==='hc'?'HentaiCity':(it.type==='series'?'Series':'Movie')))+'</p></div></a>';
 }
 function row(title,items,opts){
   opts=opts||{};if(!items||!items.length)return '';
@@ -4278,7 +4574,7 @@ function lazyMore(btn,fn){ // IntersectionObserver auto "load more"
 const NAV=[
   {k:'home',l:'Home',i:'home',dock:1},{k:'movies',l:'Movies',i:'film',dock:1},{k:'series',l:'Series',i:'tv'},
   {k:'anime',l:'Anime',i:'spark',dock:1},{k:'4k',l:'4K Hub',i:'4k'},{k:'drama',l:'Drama',i:'tv'},
-  {k:'live',l:'Live TV',i:'live',dock:1},{k:'midnight',l:'Midnight',i:'moon'},{k:'downloads',l:'Downloads',i:'dl'},{k:'library',l:'Library',i:'lib'}
+  {k:'live',l:'Live TV',i:'live',dock:1},{k:'midnight',l:'Midnight',i:'moon'},{k:'hentaicity',l:'HentaiCity',i:'moon'},{k:'downloads',l:'Downloads',i:'dl'},{k:'library',l:'Library',i:'lib'}
 ];
 function buildNav(){
   $('#nav').innerHTML='<span id="navpill"></span>'+NAV.map(n=>'<a href="#/'+n.k+'" data-k="'+n.k+'">'+n.l+'</a>').join('');
@@ -4399,7 +4695,7 @@ window.addEventListener('scroll',()=>{$('#top').classList.toggle('solid',scrollY
     h+='<em style="left:78%;animation-delay:1s"></em><em style="left:55%;animation-delay:4.5s"></em>';st.innerHTML=h}
   /* ---- theme colour ---- */
   const meta=document.createElement('meta');meta.name='theme-color';meta.content='#05060f';document.head.appendChild(meta);
-  const TC={home:'#1a1008',movies:'#07112a',series:'#150a2b',anime:'#220a18','4k':'#041a1d',drama:'#220a10',live:'#220609',midnight:'#0b0a26',downloads:'#04201a',library:'#1d1405',search:'#071626'};
+  const TC={home:'#1a1008',movies:'#07112a',series:'#150a2b',anime:'#220a18','4k':'#041a1d',drama:'#220a10',live:'#220609',midnight:'#0b0a26',hentaicity:'#2a0818',downloads:'#04201a',library:'#1d1405',search:'#071626'};
   new MutationObserver(()=>{meta.content=TC[body.dataset.sec]||'#05060f'}).observe(body,{attributes:true,attributeFilter:['data-sec']});
   /* ---- offline bar ---- */
   const off=document.getElementById('offline');
@@ -4632,7 +4928,19 @@ function pgMidnight(){
   const st={q:'',page:1,seen:new Set(),busy:false,done:false};
   V.innerHTML='<div class="pg"><div class="ph"><h1>Midnight</h1><p>Late-night shelves, 18+ only.</p><div class="acts" style="margin-top:12px"><button class="btn sm ghost" id="lock18">Lock Midnight</button></div></div>'+sBox('mq','Search Midnight…')+'<div id="mrows">'+skelRow()+skelRow()+'</div><div id="mg" class="grid" style="display:none"></div><div class="more-wrap"><button class="btn ghost" id="mm" style="display:none">Load more</button></div></div>';
   $('#lock18').onclick=()=>{store.set('sh_18',false);toast('Midnight locked');pgMidnight()};
-  api('/mb/adult/home').then(j=>{if(my!==App.nav)return;const r=mbSections(D(j));const secs=r.sections;if(r.hero.length)secs.unshift({title:'Featured',items:r.hero});secs.forEach(s=>s.items.forEach(i=>{i._adult=1}));$('#mrows').innerHTML=secs.map(s=>row(s.title,s.items)).join('')||emptyBox('No shelves right now','Try searching instead.')}).catch(e=>{$('#mrows').innerHTML=notice('Midnight',e)});
+  api('/mb/adult/home').then(j=>{if(my!==App.nav)return;const r=mbSections(D(j));const secs=r.sections;if(r.hero.length)secs.unshift({title:'Featured',items:r.hero});secs.forEach(s=>s.items.forEach(i=>{i._adult=1}));$('#mrows').innerHTML=secs.map(s=>row(s.title,s.items)).join('')||''}).catch(e=>{$('#mrows').innerHTML=notice('Midnight MovieBox',e)});
+  // HentaiCity shelves on Midnight
+  Promise.allSettled([api('/hc/recent'),api('/hc/popular')]).then(rs=>{
+    if(my!==App.nav)return;
+    let h='<div class="rh" style="margin-top:8px"><h2>HentaiCity</h2><a class="btn sm ghost" href="#/hentaicity">Open full page</a></div>';
+    rs.forEach((r,i)=>{
+      if(r.status!=='fulfilled')return;
+      const items=(Array.isArray(D(r.value))?D(r.value):(D(r.value).items||D(r.value).data||[])).map(hcItem).filter(Boolean);
+      items.forEach(x=>SEEN.set('hc:'+x.folder+'/'+x.numeric_id,x));
+      h+=row(i===0?'HC · Recent':'HC · Popular',items);
+    });
+    $('#mrows').insertAdjacentHTML('beforeend',h);
+  });
   const g=$('#mg'),mm=$('#mm');
   const load=async reset=>{
     if(st.busy||!st.q)return;st.busy=true;mm.disabled=true;
@@ -4647,6 +4955,131 @@ function pgMidnight(){
   mm.onclick=()=>load(false);lazyMore(mm,()=>load(false));
   $('#mq').oninput=debounce(e=>{st.q=e.target.value.trim();const on=!!st.q;$('#mrows').style.display=on?'none':'';g.style.display=on?'':'none';mm.style.display=on?'':'none';if(on)load(true)},500);
 }
+
+
+/* ----- HENTAICITY ----- */
+function pgHentaiCity(){
+  const my=App.nav;
+  if(!store.get('sh_18',false)){
+    V.innerHTML='<div class="pg gate"><div class="box"><div class="moon"></div><h1>HentaiCity</h1><p>Adult-only streams. Continue only if you are 18+ and it is legal where you live.</p><div class="acts"><button class="btn pri" id="y18">I am 18 or older</button><a class="btn ghost" href="#/home">Back</a></div></div></div>';
+    $('#y18').onclick=()=>{store.set('sh_18',true);pgHentaiCity()};return;
+  }
+  const st={q:'',busy:false};
+  V.innerHTML='<div class="pg"><div class="ph"><h1>HentaiCity</h1><p>Direct MP4 + HLS · hold any poster to preview trailer · tap for quality player.</p><div class="acts" style="margin-top:12px"><a class="btn sm ghost" href="#/midnight">Midnight</a><button class="btn sm ghost" id="lock18">Lock 18+</button></div></div>'
+    +sBox('hcq','Search HentaiCity…')
+    +'<div id="hcrows">'+skelRow()+skelRow()+'</div><div id="hcg" class="grid" style="display:none"></div></div>';
+  $('#lock18').onclick=()=>{store.set('sh_18',false);toast('Locked');pgHentaiCity()};
+  const paint=()=>{
+    Promise.allSettled([api('/hc/recent'),api('/hc/popular')]).then(rs=>{
+      if(my!==App.nav)return;let h='';
+      const labels=['Recent','Popular'];
+      rs.forEach((r,i)=>{
+        if(r.status!=='fulfilled')return;
+        const raw=D(r.value);const arr=Array.isArray(raw)?raw:(raw.items||raw.data||[]);
+        const items=arr.map(hcItem).filter(Boolean);
+        items.forEach(x=>SEEN.set('hc:'+x.folder+'/'+x.numeric_id,x));
+        h+=row('HentaiCity · '+labels[i],items);
+      });
+      $('#hcrows').innerHTML=h||emptyBox('No items','Seed CDN may be loading — retry.');
+    });
+  };
+  paint();
+  const g=$('#hcg');
+  const search=async q=>{
+    if(st.busy)return;st.busy=true;g.style.display='';$('#hcrows').style.display='none';g.innerHTML=skelGrid(12).replace('<div class="grid">','').replace(/<\/div>$/,'');
+    try{
+      const j=await api('/hc/search?q='+enc(q),{ttl:120000});
+      const raw=D(j);const arr=Array.isArray(raw)?raw:(raw.items||[]);
+      const items=arr.map(hcItem).filter(Boolean);
+      items.forEach(x=>SEEN.set('hc:'+x.folder+'/'+x.numeric_id,x));
+      g.innerHTML=items.map(x=>card(x)).join('')||'<div class="empty" style="grid-column:1/-1"><b>No results</b></div>';
+    }catch(e){g.innerHTML='<div style="grid-column:1/-1">'+emptyBox('Search failed',e.message)+'</div>'}
+    finally{st.busy=false}
+  };
+  $('#hcq').oninput=debounce(e=>{const q=e.target.value.trim();if(!q){$('#hcrows').style.display='';g.style.display='none';return}search(q)},450);
+}
+
+function hcSources(streams){
+  if(!streams)return[];
+  const out=[];
+  const mp4=streams.mp4||{};
+  [['1080p',mp4['1080p']],['720p',mp4['720p']],['480p',mp4['480p']],['default',mp4.default],['mobile',mp4.mobile]].forEach(([lab,u])=>{
+    if(u)out.push({kind:'mp4',url:u,label:lab,quality:lab,q:qNum(lab)});
+  });
+  if(streams.hls)out.push({kind:'hls',url:streams.hls,label:'HLS adaptive',quality:'HLS',q:2000});
+  return out;
+}
+
+async function dtHC(folder,vid,q){
+  const my=++DT.id;
+  const key=folder+'/'+vid;
+  const seen=SEEN.get('hc:'+key);
+  showDetail(topBar()+'<div class="dbody"><div class="sk" style="height:34px;width:60%;margin:20px 0"></div><div class="sk" style="aspect-ratio:16/9"></div></div>',seen&&seen.poster);
+  let d={}, streams=null;
+  try{
+    const j=await api('/hc/watch?folder='+enc(folder)+'&vid='+enc(vid),{ttl:300000});
+    d=D(j)||{};
+    streams=d.streams||d;
+  }catch(e){
+    try{const j2=await api('/hc/cdn?folder='+enc(folder)+'&vid='+enc(vid));streams=D(j2)||{}}catch(_){}
+  }
+  if(my!==DT.id)return;
+  if(!streams||!(streams.mp4||streams.hls)){
+    streams=_hc_client_cdn(folder,vid);
+  }
+  const it={provider:'hc',id:key,folder,numeric_id:vid,title:d.title||(seen&&seen.title)||('HC '+vid),
+    poster:streams.poster||(seen&&seen.poster)||'',trailer:streams.trailer||'',type:'movie',genre:'HentaiCity',_adult:1};
+  SEEN.set('hc:'+key,it);
+  const srcs=hcSources(streams);
+  showDetail(detailShell(it,
+    '<button class="btn pri" data-playbtn>'+ico('play')+'Play</button>'+(it.trailer?'<button class="btn ghost" data-trailerbtn>'+ico('play')+'Trailer</button>':''),
+    '<div id="pbox" style="margin-top:22px">'+cover(it.poster,it.title)+'</div>'
+    +'<div class="panel" style="margin-top:16px"><b>Quality</b><div class="hc-q" id="hcqbtns"></div><div class="note">Pick a quality — MP4 is direct CDN. HLS is adaptive.</div></div>'
+    +'<div id="tabsbox"></div>'),it.poster);
+  bindList(it);
+  const box=$('#pbox');
+  const qbox=$('#hcqbtns');
+  let cur=0;
+  const renderQ=()=>{
+    qbox.innerHTML=srcs.map((s,i)=>'<button type="button" class="'+(i===cur?'on':'')+'" data-qi="'+i+'">'+esc(s.label||s.quality)+'</button>').join('')||'<span class="note">No streams</span>';
+  };
+  renderQ();
+  qbox.onclick=e=>{const b=e.target.closest('[data-qi]');if(!b)return;cur=+b.dataset.qi;renderQ();play()};
+  function play(){
+    if(!srcs.length){toast('No streams');return}
+    const ordered=srcs.slice(cur).concat(srcs.slice(0,cur));
+    box.innerHTML='';
+    mountPlayer(box,ordered,{title:it.title,sub:'HentaiCity',poster:it.poster,onProgress:(t,dd)=>lib.save(it,t,dd)});
+    box.scrollIntoView({behavior:'smooth',block:'center'});
+  }
+  $('[data-playbtn]','#dcontent').onclick=play;
+  const tb=$('[data-trailerbtn]','#dcontent');
+  if(tb)tb.onclick=()=>{
+    openTheatre({title:it.title+' · Trailer',sources:[{kind:'mp4',url:it.trailer,label:'Trailer'}],poster:it.poster});
+  };
+  const pc=$('#pcv');if(pc)pc.onclick=play;
+  tabsUI($('#tabsbox'),[
+    {k:'dl',l:'Downloads',fn:c=>{
+      c.innerHTML='<div class="dl">'+srcs.map(s=>linkRow({label:s.label,url:s.url,kind:s.kind,quality:s.quality})).join('')+'</div>';
+    }},
+    {k:'info',l:'Info',fn:c=>{
+      c.innerHTML='<div class="panel"><p class="dd">Folder <b>'+esc(folder)+'</b> · ID <b>'+esc(vid)+'</b></p>'
+        +'<p class="dd">Hold any poster on the grid to preview the trailer. Quality buttons switch the in-page player.</p>'
+        +(it.trailer?'<p class="dd"><a href="'+esc(it.trailer)+'" target="_blank" rel="noopener">Open trailer URL</a></p>':'')
+        +'</div>';
+    }}
+  ],'dl');
+  if(q.get('play'))play();
+}
+function _hc_client_cdn(folder,vid){
+  const base='https://www.hentaicity.com/flv/'+folder+'/'+vid;
+  return{folder,video_id:vid,
+    hls:'https://hls.hentaicity.com/_hls/flv/'+folder+'/'+vid+'/,default,mobile,480p,720p,1080p,.mp4.urlset/master.m3u8',
+    mp4:{mobile:base+'/mobile.mp4',default:base+'/default.mp4','480p':base+'/480p.mp4','720p':base+'/720p.mp4','1080p':base+'/1080p.mp4'},
+    poster:'https://cdn1.images.hentaicity.com/videos/'+folder+'/'+vid+'/main.jpg',
+    trailer:'https://cdn1.hentaicity.com/'+folder+'/'+vid+'/trailer.mp4'};
+}
+
 
 /* ----- shared link rows (download / play / copy) ----- */
 function linkRow(l){
@@ -4854,9 +5287,24 @@ async function dtMB(id,q){
   if(q.get('play')){play()}
 }
 async function mbStreamsFor(id,se,ep){
-  const j=await api('/mb/cdn/'+enc(id)+(se!=null?'?se='+se+'&ep='+ep:''),{ttl:240000,timeout:60000});
-  const list=mbStreams(D(j));
+  const qs=(se!=null?'?se='+se+'&ep='+ep:'');
+  const [cdn,play,ex]=await Promise.allSettled([
+    api('/mb/cdn/'+enc(id)+qs,{ttl:240000,timeout:60000}),
+    api('/mb/play/'+enc(id)+qs,{ttl:240000,timeout:60000}),
+    api('/mb/dash/extract?subject_id='+enc(id)+(se!=null?'&se='+se+'&ep='+ep:''),{ttl:240000,timeout:90000}),
+  ]);
+  const bag={};
+  if(cdn.status==='fulfilled')Object.assign(bag,D(cdn.value)||{});
+  if(play.status==='fulfilled'){const p=D(play.value)||{};bag.streams=p.streams||[];bag.dash_extractor=p.dash_extractor||bag.dash_extractor}
+  if(ex.status==='fulfilled'){const e=D(ex.value)||{};bag.dash_extractor=e.dash_extractor||bag.dash_extractor}
+  const list=mbStreams(bag);
+  // ensure every dash has play_url for cookie-free play
+  list.forEach(s=>{
+    if(s.kind==='dash'&&!s.play_url&&s.base)s.play_url=dashProxyUrl(s.base,s.cookie||'');
+  });
   if(!list.length)throw new Error('MovieBox returned no streams for this selection');
+  // MP4 first in player
+  list.sort((a,b)=>(a.kind==='mp4'?0:a.kind==='hls'?1:2)-(b.kind==='mp4'?0:b.kind==='hls'?1:2)||(b.q-a.q));
   return list;
 }
 
@@ -5044,16 +5492,53 @@ function closeTheatre(){
 document.addEventListener('keydown',e=>{if(e.key==='Escape'){if($('#theatre').classList.contains('open'))closeTheatre();else if($('#detail').classList.contains('open')&&!document.fullscreenElement)goBack();else $('#sheet').classList.remove('open')}});
 
 /* ===== router ===== */
-const PAGES={home:pgHome,movies:()=>pgBrowse('movies'),series:()=>pgBrowse('series'),anime:pgAnime,'4k':pg4k,drama:pgDrama,live:pgLive,midnight:pgMidnight,downloads:pgDownloads,library:pgLibrary};
+
+/* ---- hold poster → trailer preview ---- */
+(function(){
+  let holdT=null, active=null;
+  function stop(){
+    if(holdT){clearTimeout(holdT);holdT=null}
+    if(active){
+      const v=active.querySelector('video[data-tr]');
+      if(v){try{v.pause()}catch(e){} v.remove()}
+      active.classList.remove('trailer-on');active=null;
+    }
+  }
+  function start(poster){
+    const url=poster.getAttribute('data-trailer');if(!url)return;
+    stop();
+    holdT=setTimeout(()=>{
+      holdT=null;active=poster;poster.classList.add('trailer-on');
+      const v=document.createElement('video');
+      v.setAttribute('data-tr','1');v.muted=true;v.loop=true;v.playsInline=true;v.setAttribute('playsinline','');
+      v.src=url;v.style.cssText='position:absolute;inset:0;width:100%;height:100%;object-fit:cover;z-index:2;border-radius:inherit';
+      poster.appendChild(v);v.play().catch(()=>{});
+    },420);
+  }
+  document.addEventListener('pointerdown',e=>{
+    const p=e.target.closest('.poster[data-trailer]');if(!p)return;
+    // don't navigate yet
+    start(p);
+  },{passive:true});
+  document.addEventListener('pointerup',stop,{passive:true});
+  document.addEventListener('pointercancel',stop,{passive:true});
+  document.addEventListener('pointerleave',e=>{if(e.target.closest&&e.target.closest('.poster'))stop()},{passive:true});
+  document.addEventListener('click',e=>{
+    const p=e.target.closest('.poster[data-trailer]');
+    if(p&&p.classList.contains('trailer-on')){e.preventDefault();e.stopPropagation();stop()}
+  },true);
+})();
+
+const PAGES={home:pgHome,movies:()=>pgBrowse('movies'),series:()=>pgBrowse('series'),anime:pgAnime,'4k':pg4k,drama:pgDrama,live:pgLive,midnight:pgMidnight,hentaicity:pgHentaiCity,downloads:pgDownloads,library:pgLibrary};
 function route(){
   const raw=(location.hash||'#/home').slice(1);const [path,qs]=raw.split('?');
   const parts=path.split('/').filter(Boolean).map(s=>{try{return decodeURIComponent(s)}catch(e){return s}});
   const q=new URLSearchParams(qs||'');const k=parts[0]||'home';App.navCount++;
   closeTheatre();
-  if(['mb','ha','hau','fk','dr'].includes(k)){
+  if(['mb','ha','hau','fk','dr','hc'].includes(k)){
     if(!parts[1]){location.hash='#/home';return}
     if(!$('#view').children.length){App.pageKey=null;App.nav++;PAGES.home()} // direct link: render home behind
-    if(k==='mb')dtMB(parts[1],q);else if(k==='ha')dtHA(parts[1],q,false);else if(k==='hau')dtHA(parts[1],q,true);else if(k==='fk')dtFK(parts[1],q);else dtDR(parts[1],parts[2]||'movies',q);
+    if(k==='mb')dtMB(parts[1],q);else if(k==='ha')dtHA(parts[1],q,false);else if(k==='hau')dtHA(parts[1],q,true);else if(k==='fk')dtFK(parts[1],q);else if(k==='hc')dtHC(parts[1],parts[2]||'',q);else dtDR(parts[1],parts[2]||'movies',q);
     return;
   }
   closeDetail();
