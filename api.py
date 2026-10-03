@@ -1,4 +1,4 @@
-# StreamHub API v8.1.5 — creator: shawon
+# StreamHub API v8.1.6 — creator: shawon
 from __future__ import annotations
 
 import asyncio, base64, hashlib, hmac, json, random, re, time, uuid
@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
-CREATOR, VERSION = "shawon", "8.1.5"
+CREATOR, VERSION = "shawon", "8.1.6"
 app = FastAPI(title="StreamHub API", version=VERSION, docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -1531,6 +1531,7 @@ def _kt_headers(auth: Optional[str] = None, extra: Optional[dict] = None) -> dic
         "Origin": KT_ORIGIN,
         "Referer": KT_ORIGIN + "/",
         "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
     }
     if auth:
         token = auth if auth.lower().startswith("bearer ") else f"Bearer {auth}"
@@ -1584,15 +1585,164 @@ def _kt_wrap(status: int, data, endpoint: str, access: str = "public", **extra):
                 out[k] = data[k]
     return out
 
+
 def _kt_leading_zero_bits(digest: bytes) -> int:
     n = 0
     for b in digest:
         if b == 0:
             n += 8
-        else:
-            n += 8 - b.bit_length()
-            break
+            continue
+        for i in range(7, -1, -1):
+            if b & (1 << i):
+                return n
+            n += 1
+        break
     return n
+
+def _kt_pow_solve(nonce: str, bits: int = 16, max_iters: int = 5_000_000) -> Optional[str]:
+    """sha256(nonce + ':' + solution) leading zero bits >= bits."""
+    if not nonce:
+        return None
+    target = int(bits or 16)
+    for i in range(max_iters):
+        dig = hashlib.sha256(f"{nonce}:{i}".encode()).digest()
+        if _kt_leading_zero_bits(dig) >= target:
+            return str(i)
+    return None
+
+KT_AES_KEY_STR = "bca9e0df1a5abb32906ca3f63ac04cef"
+
+def _kt_b64url_decode(s: str) -> bytes:
+    s = s.replace("-", "+").replace("_", "/")
+    pad = len(s) % 4
+    if pad:
+        s += "=" * (4 - pad)
+    return base64.b64decode(s)
+
+def _kt_decrypt_url(enc: str) -> str:
+    """AES-256-CBC decrypt kartoons link URL (IV||ciphertext, base64url)."""
+    if not enc or not isinstance(enc, str):
+        return enc or ""
+    if enc.startswith("http://") or enc.startswith("https://"):
+        return enc
+    try:
+        raw = _kt_b64url_decode(enc.strip())
+        if len(raw) < 17:
+            return enc
+        iv, ct = raw[:16], raw[16:]
+        key = (KT_AES_KEY_STR.ljust(32)[:32]).encode("utf-8")
+        dec = None
+        try:
+            from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+            from cryptography.hazmat.backends import default_backend
+            decryptor = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend()).decryptor()
+            dec = decryptor.update(ct) + decryptor.finalize()
+        except Exception:
+            try:
+                import subprocess
+                p = subprocess.run(
+                    ["openssl", "enc", "-d", "-aes-256-cbc", "-K", key.hex(), "-iv", iv.hex(), "-nopad"],
+                    input=ct, capture_output=True, timeout=10,
+                )
+                if p.returncode == 0:
+                    dec = p.stdout
+            except Exception:
+                dec = None
+        if not dec:
+            return enc
+        pad = dec[-1]
+        if 1 <= pad <= 16 and dec.endswith(bytes([pad]) * pad):
+            dec = dec[:-pad]
+        out = dec.decode("utf-8", errors="strict")
+        return out if out.startswith("http") else enc
+    except Exception:
+        return enc
+
+async def _kt_fetch_links(episode_id: Optional[str] = None, movie_id: Optional[str] = None, auth: Optional[str] = None) -> dict:
+    """POW solve + decrypt stream CDN links. No turnstile needed when POW headers work."""
+    auth = (str(auth).strip().replace("Bearer ","").replace("bearer ","").strip() if auth else None)
+    content = f"episode:{episode_id}" if episode_id else f"movie:{movie_id}"
+    path = f"/shows/episode/{episode_id}/links" if episode_id else f"/movies/{movie_id}/links"
+    # 1) POW
+    st_pow, pow_data = await _kt_req("GET", "/challenge/pow", params={"content": content})
+    nonce = bits = sol = None
+    if isinstance(pow_data, dict):
+        root = pow_data.get("data") if isinstance(pow_data.get("data"), dict) else pow_data
+        nonce = root.get("nonce")
+        bits = int(root.get("bits") or 16)
+    if nonce:
+        sol = await asyncio.to_thread(_kt_pow_solve, nonce, bits)
+    headers_extra = {}
+    if nonce and sol:
+        headers_extra = {"X-Pow-Nonce": nonce, "X-Pow-Solution": sol}
+    # 2) links with POW headers (custom request)
+    url = KT_API + path
+    async with _client(30.0) as client:
+        h = _kt_headers(auth)
+        h.update(headers_extra)
+        r = await client.get(url, headers=h)
+        try:
+            data = r.json()
+        except Exception:
+            data = {"raw": r.text[:2000]}
+        st = r.status_code
+    # retry once with fresh POW if failed
+    if st in (403, 428) or (isinstance(data, dict) and ("pow" in str(data).lower() or data.get("challenge_required"))):
+        st_pow, pow_data = await _kt_req("GET", "/challenge/pow", params={"content": content})
+        if isinstance(pow_data, dict):
+            root = pow_data.get("data") if isinstance(pow_data.get("data"), dict) else pow_data
+            nonce = root.get("nonce")
+            bits = int(root.get("bits") or 16)
+            sol = await asyncio.to_thread(_kt_pow_solve, nonce, bits) if nonce else None
+        if nonce and sol:
+            async with _client(30.0) as client:
+                h = _kt_headers(auth)
+                h["X-Pow-Nonce"] = nonce
+                h["X-Pow-Solution"] = sol
+                r = await client.get(url, headers=h)
+                try:
+                    data = r.json()
+                except Exception:
+                    data = {"raw": r.text[:2000]}
+                st = r.status_code
+    payload = data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), dict) else data
+    links_raw = []
+    if isinstance(payload, dict):
+        links_raw = payload.get("links") or []
+    servers = []
+    direct = []
+    for L in links_raw if isinstance(links_raw, list) else []:
+        if not isinstance(L, dict):
+            continue
+        enc = L.get("url") or ""
+        plain = _kt_decrypt_url(enc)
+        item = {
+            "name": L.get("name") or "Server",
+            "url": plain,
+            "encrypted_url": enc if plain != enc else None,
+            "type": "hls" if ".m3u8" in plain or "playlist" in plain else ("mp4" if ".mp4" in plain else "link"),
+            "spriteVtt": L.get("spriteVtt"),
+            "subtitles": L.get("subtitles") or [],
+            "skipTimings": L.get("skipTimings") or [],
+            "chapters": L.get("chapters") or [],
+        }
+        servers.append(item)
+        if plain.startswith("http"):
+            direct.append({"name": item["name"], "url": plain, "type": item["type"]})
+    title = payload.get("title") if isinstance(payload, dict) else None
+    return {
+        "ok": st < 400 and len(direct) > 0,
+        "status": st,
+        "title": title,
+        "episode_id": episode_id,
+        "movie_id": movie_id,
+        "servers": servers,
+        "direct": direct,
+        "direct_count": len(direct),
+        "pow": {"nonce": (nonce or "")[:40] + "…", "solution": sol, "bits": bits},
+        "raw_error": data if st >= 400 else None,
+    }
+
 
 def _kt_solve_pow(nonce: str, bits: int, max_iters: int = 8_000_000) -> Optional[str]:
     target = int(bits)
@@ -1724,135 +1874,76 @@ async def kt_challenge_verify(
     st, data = await _kt_req("POST", "/challenge/verify", json_body=body)
     return _kt_wrap(st, data, "challenge_verify", "challenge")
 
-@app.get("/kt/episode/{episode_id}/links", tags=["Kartoons-Challenge"])
-async def kt_episode_links(episode_id: str, turnstile_token: Optional[str] = None):
-    """Stream/CDN link list for episode. Usually challenge_required without valid Turnstile session."""
-    # Optional: try POW+verify if token given
-    if turnstile_token:
-        content = f"episode:{episode_id}"
-        st0, pow_raw = await _kt_req("GET", "/challenge/pow", {"content": content})
-        if st0 == 200 and isinstance(pow_raw, dict) and pow_raw.get("data"):
-            powd = pow_raw["data"]
-            sol = _kt_solve_pow(powd.get("nonce") or "", int(powd.get("bits") or 16))
-            if sol:
-                await _kt_req("POST", "/challenge/verify", json_body={
-                    "turnstile_token": turnstile_token,
-                    "content": content,
-                    "nonce": powd.get("nonce"),
-                    "solution": sol,
-                })
-    st, data = await _kt_req("GET", f"/shows/episode/{episode_id}/links")
-    return _kt_wrap(st, data, "episode_links", "challenge", how="Without Turnstile → 403. Pass turnstile_token from browser, or open embeds on site.")
+@app.get("/kt/episode/{episode_id}/links", tags=["Kartoons-Public"])
+async def kt_episode_links(
+    episode_id: str,
+    auth: Optional[str] = Query(None, description="JWT access_token recommended"),
+    turnstile_token: Optional[str] = Query(None, description="Leave empty — POW auto-solved"),
+):
+    """Same as /kt/stream — POW + AES decrypt → direct CDN."""
+    if not auth and turnstile_token and str(turnstile_token).startswith("eyJ"):
+        auth = turnstile_token
+    result = await _kt_fetch_links(episode_id=episode_id, auth=auth)
+    if result.get("direct_count", 0) > 0:
+        return ok(result, provider="kartoons", endpoint="episode_links", level="live")
+    return fail("No links", provider="kartoons", endpoint="episode_links", data=result, status=result.get("status") or 502)
 
-@app.get("/kt/movie/{movie_id}/links", tags=["Kartoons-Challenge"])
-async def kt_movie_links(movie_id: str, turnstile_token: Optional[str] = None):
-    if turnstile_token:
-        content = f"movie:{movie_id}"
-        st0, pow_raw = await _kt_req("GET", "/challenge/pow", {"content": content})
-        if st0 == 200 and isinstance(pow_raw, dict) and pow_raw.get("data"):
-            powd = pow_raw["data"]
-            sol = _kt_solve_pow(powd.get("nonce") or "", int(powd.get("bits") or 16))
-            if sol:
-                await _kt_req("POST", "/challenge/verify", json_body={
-                    "turnstile_token": turnstile_token, "content": content,
-                    "nonce": powd.get("nonce"), "solution": sol,
-                })
-    st, data = await _kt_req("GET", f"/movies/{movie_id}/links")
-    return _kt_wrap(st, data, "movie_links", "challenge")
 
-@app.get("/kt/stream", tags=["Kartoons-Challenge"])
+@app.get("/kt/movie/{movie_id}/links", tags=["Kartoons-Public"])
+async def kt_movie_links(
+    movie_id: str,
+    auth: Optional[str] = Query(None),
+    turnstile_token: Optional[str] = Query(None),
+):
+    if not auth and turnstile_token and str(turnstile_token).startswith("eyJ"):
+        auth = turnstile_token
+    result = await _kt_fetch_links(movie_id=movie_id, auth=auth)
+    if result.get("direct_count", 0) > 0:
+        return ok(result, provider="kartoons", endpoint="movie_links", level="live")
+    return fail("No links", provider="kartoons", endpoint="movie_links", data=result, status=result.get("status") or 502)
+
+
+@app.get("/kt/stream", tags=["Kartoons-Public"])
 async def kt_stream(
-    episode_id: Optional[str] = None,
-    movie_id: Optional[str] = None,
-    turnstile_token: Optional[str] = None,
+    episode_id: Optional[str] = Query(None, description="Episode Mongo id"),
+    movie_id: Optional[str] = Query(None, description="Movie id"),
+    auth: Optional[str] = Query(None, description="Optional JWT access_token (not turnstile)"),
+    turnstile_token: Optional[str] = Query(None, description="Ignored for POW path — keep empty"),
 ):
     """
-    Convenience stream resolver.
-    1) Loads episode/movie meta (public)
-    2) Tries /links (needs Turnstile on this IP)
-    3) Returns normalized servers[] when available
+    Direct streaming CDN (HLS/mp4) via auto POW + AES decrypt.
+    Example: /kt/stream?episode_id=6867877f57ee07b9b7401910
+    Optional: &auth=JWT
+    Do NOT put JWT in turnstile_token.
     """
+    # if user mistakenly put JWT in turnstile field
+    if not auth and turnstile_token and str(turnstile_token).startswith("eyJ"):
+        auth = turnstile_token
     if not episode_id and not movie_id:
-        raise HTTPException(400, detail=fail("episode_id or movie_id required", provider="kartoons"))
-    meta = None
-    links_data = None
-    status = 0
-    if episode_id:
-        st_m, meta_raw = await _kt_req("GET", f"/shows/episode/{episode_id}")
-        meta = meta_raw.get("data") if isinstance(meta_raw, dict) else meta_raw
-        if turnstile_token:
-            content = f"episode:{episode_id}"
-            st0, pow_raw = await _kt_req("GET", "/challenge/pow", {"content": content})
-            if st0 == 200 and isinstance(pow_raw, dict) and pow_raw.get("data"):
-                powd = pow_raw["data"]
-                sol = _kt_solve_pow(powd.get("nonce") or "", int(powd.get("bits") or 16))
-                if sol:
-                    await _kt_req("POST", "/challenge/verify", json_body={
-                        "turnstile_token": turnstile_token, "content": content,
-                        "nonce": powd.get("nonce"), "solution": sol,
-                    })
-        status, links_raw = await _kt_req("GET", f"/shows/episode/{episode_id}/links")
-        links_data = links_raw
-    else:
-        st_m, meta_raw = await _kt_req("GET", f"/movies/{movie_id}")
-        meta = meta_raw.get("data") if isinstance(meta_raw, dict) else meta_raw
-        if turnstile_token:
-            content = f"movie:{movie_id}"
-            st0, pow_raw = await _kt_req("GET", "/challenge/pow", {"content": content})
-            if st0 == 200 and isinstance(pow_raw, dict) and pow_raw.get("data"):
-                powd = pow_raw["data"]
-                sol = _kt_solve_pow(powd.get("nonce") or "", int(powd.get("bits") or 16))
-                if sol:
-                    await _kt_req("POST", "/challenge/verify", json_body={
-                        "turnstile_token": turnstile_token, "content": content,
-                        "nonce": powd.get("nonce"), "solution": sol,
-                    })
-        status, links_raw = await _kt_req("GET", f"/movies/{movie_id}/links")
-        links_data = links_raw
+        return fail("episode_id or movie_id required", provider="kartoons", endpoint="stream",
+                    how="GET /kt/stream?episode_id=ID  or  /kt/stream?movie_id=ID")
+    try:
+        result = await _kt_fetch_links(episode_id=episode_id, movie_id=movie_id, auth=auth)
+    except Exception as e:
+        return fail(str(e), provider="kartoons", endpoint="stream")
+    if result.get("direct_count", 0) > 0:
+        return ok({
+            "title": result.get("title"),
+            "episode_id": episode_id,
+            "movie_id": movie_id,
+            "direct": result["direct"],
+            "servers": result["servers"],
+            "direct_count": result["direct_count"],
+            "how": "Play direct[].url in VLC / ExoPlayer / hls.js (usually HLS m3u8)",
+        }, provider="kartoons", endpoint="stream", access="public", level="live")
+    return fail(
+        "No stream links (POW or upstream)",
+        provider="kartoons", endpoint="stream",
+        status=result.get("status") or 502,
+        data=result,
+        how="Retry; ensure episode_id is valid. Auth optional. Turnstile not required for POW path.",
+    )
 
-    servers = []
-    challenge = isinstance(links_data, dict) and links_data.get("challenge_required")
-    raw_links = []
-    if isinstance(links_data, dict) and not challenge:
-        payload = links_data.get("data") if "data" in links_data else links_data
-        if isinstance(payload, list):
-            raw_links = payload
-        elif isinstance(payload, dict):
-            raw_links = payload.get("links") or payload.get("servers") or payload.get("sources") or []
-            if not raw_links and payload.get("url"):
-                raw_links = [payload]
-    for item in raw_links or []:
-        if not isinstance(item, dict):
-            continue
-        url = item.get("url") or item.get("link") or item.get("file") or item.get("src")
-        if not url:
-            continue
-        kind = "hls" if ".m3u8" in str(url) else ("mp4" if ".mp4" in str(url) or "get_video" in str(url) else "link")
-        if "embed" in str(url) or item.get("type") == "iframe":
-            kind = "iframe"
-        servers.append({
-            "name": item.get("name") or item.get("label") or item.get("server") or "Server",
-            "type": kind,
-            "url": url,
-            "quality": item.get("quality") or item.get("resolution"),
-            "audio": item.get("audio") or item.get("lang"),
-            "raw": item,
-        })
-    return ok({
-        "meta": meta,
-        "servers": servers,
-        "direct": [s for s in servers if s["type"] in ("mp4", "hls")],
-        "direct_count": len([s for s in servers if s["type"] in ("mp4", "hls")]),
-        "links_http": status,
-        "challenge_required": bool(challenge),
-        "links_raw": links_data if challenge or status >= 400 else None,
-        "how": (
-            "Public: meta always. Stream CDN: needs Cloudflare Turnstile from browser on kartoons.to, "
-            "then pass turnstile_token=... here. POW is auto-solved server-side."
-        ),
-    }, provider="kartoons", endpoint="stream", access="challenge" if challenge else "public")
-
-# Challenge-gated catalog helpers (same upstream 403 without token)
 @app.get("/kt/popularity/shows", tags=["Kartoons-Challenge"])
 async def kt_pop_shows():
     st, data = await _kt_req("GET", "/popularity/shows")
@@ -2147,7 +2238,7 @@ async def _kt_me_payload(token: str) -> dict:
         return ok({
             "valid": True,
             "token": token,
-            "user": me if isinstance(me, dict) else None,
+            "user": ({k:v for k,v in me.items() if k != "hashed_password"} if isinstance(me, dict) else None),
             "raw": data,
             "how": "Use this token as ?auth=TOKEN on /kt/watchlist, /kt/user/me, /kt/stremio/stream",
         }, provider="kartoons", endpoint="auth_me", access="auth")
@@ -2580,7 +2671,7 @@ footer{text-align:center;color:var(--mu);font-size:12px;padding:20px 0 10px}
 </head>
 <body>
 <header class="top">
-  <div class="brand"><div class="logo">SH</div><div><h1>StreamHub API</h1><small>v8.1.5 · creator: shawon</small></div></div>
+  <div class="brand"><div class="logo">SH</div><div><h1>StreamHub API</h1><small>v8.1.6 · creator: shawon</small></div></div>
   <div class="search"><span style="opacity:.4;font-size:13px">⌕</span><input id="q" placeholder="Filter endpoints…" oninput="filt()"/></div>
 </header>
 <div class="tabs" id="tabs"></div>
@@ -2651,7 +2742,7 @@ const E = [
 {g:'Kartoons',p:'/kt/app/update',how:'PUBLIC app version + APK download URL.',params:[]},
 {g:'Kartoons',p:'/kt/challenge/pow',how:'CHALLENGE: get POW nonce. content=episode:{id}',params:[{n:'content',v:'episode:6867877f57ee07b9b7401910'}]},
 {g:'Kartoons',p:'/kt/challenge/solve',how:'CHALLENGE: auto-solve POW. Still need browser turnstile_token for verify.',params:[{n:'content',v:'episode:6867877f57ee07b9b7401910'}]},
-{g:'Kartoons',p:'/kt/stream',how:'CHALLENGE: stream CDN. Without turnstile → challenge_required. With token may return servers[].',params:[{n:'episode_id',v:'6867877f57ee07b9b7401910'},{n:'turnstile_token',v:''}]},
+{g:'Kartoons',p:'/kt/stream',how:'AUTO POW + decrypt → direct HLS CDN. episode_id required. Optional auth=JWT. Leave turnstile empty.',params:[{n:'episode_id',v:'6867877f57ee07b9b7401910'},{n:'auth',v:''}]},
 {g:'Kartoons',p:'/kt/episode/{episode_id}/links',how:'CHALLENGE: raw links list (Turnstile). Prefer /kt/stream.',params:[{n:'episode_id',v:'6867877f57ee07b9b7401910',path:true},{n:'turnstile_token',v:''}]},
 {g:'Kartoons',p:'/kt/movie/{movie_id}/links',how:'CHALLENGE: movie stream links (Turnstile).',params:[{n:'movie_id',v:'fandub-princess-mononoke-6ac07',path:true}]},
 {g:'Kartoons',p:'/kt/popularity/shows',how:'CHALLENGE: popular shows (often 403 without Turnstile).',params:[]},
