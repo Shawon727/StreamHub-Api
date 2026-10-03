@@ -1,4 +1,4 @@
-# StreamHub API v8.1.0 — creator: shawon
+# StreamHub API v8.1.1 — creator: shawon
 from __future__ import annotations
 
 import asyncio, base64, hashlib, hmac, json, random, re, time, uuid
@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
-CREATOR, VERSION = "shawon", "8.1.0"
+CREATOR, VERSION = "shawon", "8.1.1"
 app = FastAPI(title="StreamHub API", version=VERSION, docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -1949,6 +1949,56 @@ async def kt_stremio_status(auth: str = Query(...)):
     st, data = await _kt_req("GET", "/user/stremio/status", auth=auth)
     return _kt_wrap(st, data, "stremio_status", "auth")
 
+
+@app.post("/kt/device/code", tags=["Kartoons-Public"])
+async def kt_device_code():
+    """Start TV/device link flow. User opens link_url and enters code — then poll /kt/device/status."""
+    st, data = await _kt_req("POST", "/app/device/code", json_body={})
+    # upstream returns fields at top-level sometimes
+    if isinstance(data, dict) and data.get("success") and "data" not in data and data.get("code"):
+        data = {"success": True, "data": {k: data[k] for k in data if k != "success"}}
+    return _kt_wrap(st, data, "device_code", "public", how="Poll GET /kt/device/status?code= until linked")
+
+@app.get("/kt/device/status", tags=["Kartoons-Public"])
+async def kt_device_status(code: str, fullinfo: bool = True):
+    st, data = await _kt_req("GET", "/app/device/status", {"code": code, "fullinfo": str(fullinfo).lower()})
+    return _kt_wrap(st, data, "device_status", "public")
+
+@app.get("/kt/stremio/stream", tags=["Kartoons-Auth"])
+async def kt_stremio_stream(
+    token: str = Query(..., description="Kartoons account token after login"),
+    episode_id: Optional[str] = None,
+    movie_id: Optional[str] = None,
+    kind: str = Query("series", description="series|movie"),
+):
+    """Authenticated Stremio stream list. Real login token required (401 if fake)."""
+    if not episode_id and not movie_id:
+        raise HTTPException(400, detail=fail("episode_id or movie_id required", provider="kartoons"))
+    cid = episode_id or movie_id
+    k = "movie" if (movie_id or kind == "movie") else "series"
+    path = f"/stremio/stream/{k}/{cid}.json"
+    st, data = await _kt_req("GET", path, params={"token": token})
+    servers = []
+    if isinstance(data, dict):
+        streams = data.get("streams") or []
+        if isinstance(data.get("data"), list):
+            streams = data["data"]
+        if isinstance(streams, list):
+            for s in streams:
+                if not isinstance(s, dict):
+                    continue
+                url = s.get("url") or s.get("externalUrl")
+                if not url:
+                    continue
+                servers.append({
+                    "name": s.get("name") or s.get("title") or "Stremio",
+                    "type": "hls" if ".m3u8" in str(url) else ("mp4" if ".mp4" in str(url) else "link"),
+                    "url": url, "raw": s,
+                })
+    return _kt_wrap(st, data, "stremio_stream", "auth", servers=servers, direct_count=len(servers),
+                    how="POST /kt/auth/login → token. No captcha bypass.")
+
+
 @app.get("/kt/info", tags=["Kartoons-Public"])
 async def kt_info():
     """Overview of Kartoons integration — public vs challenge vs auth."""
@@ -1959,7 +2009,7 @@ async def kt_info():
             "GET /kt/show/{slug}/season/{season}/episodes", "GET /kt/show/{slug}/season/{season}/all-episodes",
             "GET /kt/show/{slug}/random-episode", "GET /kt/episode/{id}",
             "GET /kt/movies", "GET /kt/movies/featured", "GET /kt/movie/{id}",
-            "GET /kt/show/{slug}/comments", "GET /kt/app/update",
+            "GET /kt/show/{slug}/comments", "GET /kt/app/update", "POST /kt/device/code", "GET /kt/device/status",
         ],
         "challenge_turnstile": [
             "GET /kt/episode/{id}/links", "GET /kt/movie/{id}/links", "GET /kt/stream",
@@ -1969,12 +2019,15 @@ async def kt_info():
         "auth_login": [
             "POST /kt/auth/login", "GET /kt/auth/me", "GET /kt/user/me",
             "GET /kt/user/continue-watching", "GET /kt/watchlist", "POST /kt/watchlist/add",
-            "GET /kt/notifications", "GET /kt/user/stremio/status",
+            "GET /kt/notifications", "GET /kt/user/stremio/status", "GET /kt/stremio/stream?token=&episode_id=",
         ],
         "stream_cdn_note": (
-            "Episode/movie /links return real CDN only after Cloudflare Turnstile. "
-            "Server can solve POW (bits=16) but cannot solve Turnstile captcha. "
-            "Pass turnstile_token from browser, or use public meta + watch on kartoons.to."
+            "NO server-side bypass exists for direct CDN without human/auth. "
+            "Tested: all User-Agents, missing Origin, Android app headers, okhttp, Stremio UA — still challenge_required on /links. "
+            "Paths: (1) Browser Turnstile token → /kt/stream?turnstile_token= "
+            "(2) Logged-in user token → /kt/stremio/stream?token=&episode_id= "
+            "(3) Device link: POST /kt/device/code then user opens link_url and approves. "
+            "Captcha farms / Turnstile fraud are not supported."
         ),
         "example_flow": [
             "1. GET /kt/shows?search=shin-chan",
@@ -2203,6 +2256,44 @@ const E = [
 {g:'HindiAnime',p:'/ha/spotlights',how:'Spotlight rotation.',params:[]},
 {g:'HindiAnime',p:'/ha/trailer',how:'YouTube trailer lookup.',params:[{n:'title',v:'naruto'}]},
 {g:'HindiAnime',p:'/ha/proxy',how:'HLS proxy URLs for a videoHash + probe status.',params:[{n:'hash',v:'kqdr8'}]},
+
+{g:'Kartoons',p:'/kt/info',how:'Overview: which routes are public / Turnstile / login. Read this first.',params:[]},
+{g:'Kartoons',p:'/kt/shows',how:'PUBLIC list/search shows. Use search= keyword. Copy slug → /kt/show/{slug}.',params:[{n:'search',v:'shin'},{n:'page',v:'1'},{n:'limit',v:'10'}]},
+{g:'Kartoons',p:'/kt/shows/featured',how:'PUBLIC featured shows.',params:[]},
+{g:'Kartoons',p:'/kt/show/{slug}',how:'PUBLIC show details + seasons[]. Use season.slug for episodes.',params:[{n:'slug',v:'shin-chan-68170',path:true}]},
+{g:'Kartoons',p:'/kt/show/{slug}/season/{season_slug}/episodes',how:'PUBLIC episode list. Copy episode _id for stream/links.',params:[{n:'slug',v:'shin-chan-68170',path:true},{n:'season_slug',v:'season-1',path:true},{n:'page',v:'1'},{n:'limit',v:'30'}]},
+{g:'Kartoons',p:'/kt/show/{slug}/season/{season_slug}/all-episodes',how:'PUBLIC all episodes (no pagination).',params:[{n:'slug',v:'shin-chan-68170',path:true},{n:'season_slug',v:'season-1',path:true}]},
+{g:'Kartoons',p:'/kt/show/{slug}/random-episode',how:'PUBLIC random episode id for a show.',params:[{n:'slug',v:'shin-chan-68170',path:true}]},
+{g:'Kartoons',p:'/kt/episode/{episode_id}',how:'PUBLIC episode meta (title, duration, links_count). CDN needs /kt/stream.',params:[{n:'episode_id',v:'6867877f57ee07b9b7401910',path:true}]},
+{g:'Kartoons',p:'/kt/movies',how:'PUBLIC list/search movies.',params:[{n:'search',v:'ponyo'},{n:'page',v:'1'},{n:'limit',v:'10'}]},
+{g:'Kartoons',p:'/kt/movies/featured',how:'PUBLIC featured movies.',params:[]},
+{g:'Kartoons',p:'/kt/movie/{movie_id}',how:'PUBLIC movie details (slug or id).',params:[{n:'movie_id',v:'fandub-princess-mononoke-6ac07',path:true}]},
+{g:'Kartoons',p:'/kt/show/{slug}/comments',how:'PUBLIC comments. count_only=true for count.',params:[{n:'slug',v:'shin-chan-68170',path:true},{n:'limit',v:'5'}]},
+{g:'Kartoons',p:'/kt/app/update',how:'PUBLIC app version + APK download URL.',params:[]},
+{g:'Kartoons',p:'/kt/challenge/pow',how:'CHALLENGE: get POW nonce. content=episode:{id}',params:[{n:'content',v:'episode:6867877f57ee07b9b7401910'}]},
+{g:'Kartoons',p:'/kt/challenge/solve',how:'CHALLENGE: auto-solve POW. Still need browser turnstile_token for verify.',params:[{n:'content',v:'episode:6867877f57ee07b9b7401910'}]},
+{g:'Kartoons',p:'/kt/stream',how:'CHALLENGE: stream CDN. Without turnstile → challenge_required. With token may return servers[].',params:[{n:'episode_id',v:'6867877f57ee07b9b7401910'},{n:'turnstile_token',v:''}]},
+{g:'Kartoons',p:'/kt/episode/{episode_id}/links',how:'CHALLENGE: raw links list (Turnstile). Prefer /kt/stream.',params:[{n:'episode_id',v:'6867877f57ee07b9b7401910',path:true},{n:'turnstile_token',v:''}]},
+{g:'Kartoons',p:'/kt/movie/{movie_id}/links',how:'CHALLENGE: movie stream links (Turnstile).',params:[{n:'movie_id',v:'fandub-princess-mononoke-6ac07',path:true}]},
+{g:'Kartoons',p:'/kt/popularity/shows',how:'CHALLENGE: popular shows (often 403 without Turnstile).',params:[]},
+{g:'Kartoons',p:'/kt/popularity/movies',how:'CHALLENGE: popular movies.',params:[]},
+{g:'Kartoons',p:'/kt/popularity/trending',how:'CHALLENGE: trending.',params:[]},
+{g:'Kartoons',p:'/kt/search/suggestions',how:'CHALLENGE. Public alt: /kt/shows?search=',params:[{n:'q',v:'shin'},{n:'limit',v:'5'}]},
+{g:'Kartoons',p:'/kt/schedules/upcoming',how:'CHALLENGE: upcoming schedule.',params:[]},
+{g:'Kartoons',p:'/kt/schedules/weekly',how:'CHALLENGE: weekly schedule.',params:[]},
+{g:'Kartoons',p:'/kt/community/board',how:'CHALLENGE: community board.',params:[]},
+{g:'Kartoons',p:'/kt/community/posts',how:'CHALLENGE: community posts.',params:[]},
+{g:'Kartoons',p:'/kt/collections',how:'CHALLENGE: collections list.',params:[]},
+{g:'Kartoons',p:'/kt/suggestions/episode/{episode_id}',how:'CHALLENGE: related episode suggestions.',params:[{n:'episode_id',v:'6867877f57ee07b9b7401910',path:true}]},
+{g:'Kartoons',p:'/kt/auth/login',how:'AUTH: login → save token. Then pass auth=TOKEN on user routes. (POST — Try it may need fetch POST)',params:[{n:'email',v:''},{n:'password',v:''}]},
+{g:'Kartoons',p:'/kt/auth/me',how:'AUTH: current user. Requires auth= token.',params:[{n:'auth',v:''}]},
+{g:'Kartoons',p:'/kt/user/me',how:'AUTH: user profile.',params:[{n:'auth',v:''}]},
+{g:'Kartoons',p:'/kt/user/continue-watching',how:'AUTH: continue watching list.',params:[{n:'auth',v:''}]},
+{g:'Kartoons',p:'/kt/watchlist',how:'AUTH: watchlist.',params:[{n:'auth',v:''}]},
+{g:'Kartoons',p:'/kt/watchlist/add',how:'AUTH POST: add to watchlist.',params:[{n:'auth',v:''},{n:'content_type',v:'show'},{n:'content_id',v:''},{n:'status',v:'plan_to_watch'}]},
+{g:'Kartoons',p:'/kt/ratings/content/{ctype}/{cid}',how:'Ratings for show/movie. May need auth.',params:[{n:'ctype',v:'show',path:true},{n:'cid',v:'shin-chan-68170',path:true}]},
+{g:'Kartoons',p:'/kt/notifications',how:'AUTH: notifications.',params:[{n:'auth',v:''}]},
+{g:'Kartoons',p:'/kt/user/stremio/status',how:'AUTH: Stremio integration status.',params:[{n:'auth',v:''}]},
 {g:'Aggregate',p:'/search',how:'MovieBox + 4K + Dramachi in one response.',params:[{n:'q',v:'batman'}]},
 {g:'Meta',p:'/health',how:'Version and provider list.',params:[]},
 ];
