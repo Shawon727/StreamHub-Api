@@ -1,4 +1,4 @@
-# StreamHub API v8.2.7 — creator: shawon
+# StreamHub API v8.2.8 — creator: shawon
 from __future__ import annotations
 
 import asyncio, base64, gzip, hashlib, hmac, json, random, re, time, uuid
@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response, StreamingResponse, PlainTextResponse
 
-CREATOR, VERSION = "shawon", "8.2.7"
+CREATOR, VERSION = "shawon", "8.2.8"
 app = FastAPI(title="StreamHub API", version=VERSION, docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -204,70 +204,32 @@ def _xml_local(tag: str) -> str:
         return ""
     return tag.split("}")[-1] if "}" in tag else tag
 
-def _rewrite_mpd_for_proxy(mpd_xml: str, base: str, cookie: str) -> str:
-    """Rewrite MPD so every BaseURL / SegmentTemplate points at /px/{token}/… (absolute-path).
-    VLC and dash.js resolve segments relative to MPD URL correctly after this.
-    """
+def _rewrite_mpd_for_proxy(mpd_xml: str, base: str, cookie: str, public_base: str = "") -> str:
+    """Keep Period intact; set BaseURL so segments resolve under /px/{token}/."""
     base = (base or "").rstrip("/")
-    if not base:
+    if not base or not mpd_xml:
         return mpd_xml
     tok = _mb_dash_token(base, cookie)
-    px = f"/px/{tok}/"
+    if public_base:
+        bu = public_base.rstrip("/") + "/px/" + tok + "/"
+    else:
+        bu = "/px/" + tok + "/"
 
-    def abs_url(u: str) -> str:
-        u = (u or "").strip()
-        if not u:
-            return u
-        if u.startswith("http"):
-            return u
-        if u.startswith("/"):
-            try:
-                p = urlparse(base)
-                return f"{p.scheme}://{p.netloc}{u}"
-            except Exception:
-                return base + u
-        return base + "/" + u.lstrip("/")
-
-    def to_px_path(u: str) -> str:
-        full = abs_url(u)
-        if base and full.startswith(base):
-            rel = full[len(base):].lstrip("/")
+    text = mpd_xml.replace("\x01", "")
+    def _bu(_m):
+        return "<BaseURL>" + bu + "</BaseURL>"
+    if re.search(r"<BaseURL>[^<]*</BaseURL>", text):
+        text = re.sub(r"<BaseURL>[^<]*</BaseURL>", _bu, text, count=1)
+    else:
+        def _ins(m):
+            return m.group(1) + "<BaseURL>" + bu + "</BaseURL>"
+        text2, n = re.subn(r"(<(?:[\w.]+:)?Period\b[^>]*>)", _ins, text, count=1)
+        if n:
+            text = text2
         else:
-            try:
-                rel = urlparse(full).path.lstrip("/")
-                tail = base.split("/")[-1]
-                if tail and f"{tail}/" in rel:
-                    rel = rel.split(f"{tail}/", 1)[-1]
-            except Exception:
-                rel = full.split("/")[-1]
-        return px + rel
-
-    # Absolute BaseURL → relative path under /px (so player stays on API host)
-    def _bu(m):
-        inner = m.group(1).strip()
-        if inner.startswith("http"):
-            full = inner
-            if base and full.startswith(base):
-                rel = full[len(base):].lstrip("/") or "."
-            else:
-                try:
-                    rel = urlparse(full).path.lstrip("/")
-                except Exception:
-                    rel = "."
-            return f"<BaseURL>{rel}</BaseURL>" if rel else "<BaseURL>.</BaseURL>"
-        return m.group(0)
-
-    text = re.sub(r"<BaseURL>\s*([^<]+?)\s*</BaseURL>", _bu, mpd_xml)
-
-    # SegmentTemplate initialization / media attributes → keep relative (resolved via BaseURL)
-    # Ensure there is a Period-level BaseURL = "." so relative templates resolve under /px/tok/
-    if "<BaseURL>" not in text:
-        text = re.sub(
-            r"(<(?:\w+:)?Period[^>]*>)",
-            r'<BaseURL>.</BaseURL>',
-            text,
-            count=1,
-        )
+            text2, n = re.subn(r"(<(?:[\w.]+:)?AdaptationSet\b)", lambda m: "<BaseURL>" + bu + "</BaseURL>" + m.group(1), text, count=1)
+            if n:
+                text = text2
     return text
 
 def _parse_mpd_reps(mpd_xml: str, base: str, cookie: str, origin: str = "") -> list:
@@ -561,15 +523,19 @@ async def mb_dash_extract(
         title = inner.get("title") or inner.get("subjectName")
         for s in _mb_streams(data):
             if s.get("kind") != "dash":
+                u = s.get("url") or ""
+                # MovieBox free-tier often returns a ~1MB placeholder MP4 — flag it
+                is_placeholder = "macdn.aoneroom.com/other/" in u
                 streams_out.append({
-                    "source": "mp4",
+                    "source": "mp4_placeholder" if is_placeholder else "mp4",
                     "quality": s.get("quality"),
-                    "url": s.get("url"),
-                    "play_url": s.get("url"),
-                    "vlc_url": s.get("url"),
+                    "url": u,
+                    "play_url": u,
+                    "vlc_url": u,
                     "kind": "mp4",
                     "codec": s.get("codec"),
                     "cookie_required": False,
+                    "note": "Placeholder/trailer-sized file — use DASH play_url for full movie" if is_placeholder else None,
                 })
                 continue
             b = s.get("base") or ""
@@ -3224,7 +3190,7 @@ def _rewrite_m3u8(text: str, base_url: str, cookie: str = "") -> str:
             out.append(_gx_link(urljoin(base_url, raw), cookie))
     return "\n".join(out) + "\n"
 
-async def _proxy_fetch(request: Request, url: str, cookie: str = "", referer: str = "", dash_token: str = "", dash_base: str = ""):
+async def _proxy_fetch(request: Request, url: str, cookie: str = "", referer: str = "", dash_token: str = "", dash_base: str = "", public_base: str = ""):
     _safe_target(url)
     headers = {"User-Agent": UA, "Accept": "*/*", "Accept-Encoding": "identity"}
     if referer:
@@ -3257,7 +3223,7 @@ async def _proxy_fetch(request: Request, url: str, cookie: str = "", referer: st
             return Response(_rewrite_m3u8(text, str(r.url), cookie), media_type="application/vnd.apple.mpegurl",
                             headers={"Cache-Control": "no-store"})
         if dash_base:
-            text = _rewrite_mpd_for_proxy(text, dash_base, cookie)
+            text = _rewrite_mpd_for_proxy(text, dash_base, cookie, public_base=public_base or str(request.base_url).rstrip("/"))
         return Response(
             text,
             media_type="application/dash+xml",
@@ -3301,7 +3267,7 @@ async def px_dash(token: str, path: str, request: Request):
     target = base + "/" + rel
     if request.url.query:
         target += "?" + request.url.query
-    return await _proxy_fetch(request, target, cookie=cookie, dash_base=base)
+    return await _proxy_fetch(request, target, cookie=cookie, dash_base=base, public_base=str(request.base_url).rstrip("/"))
 
 @app.get("/gx", tags=["Proxy"], include_in_schema=False)
 async def gx_proxy(request: Request, u: str = Query(...), c: str = Query("")):
@@ -3364,7 +3330,7 @@ footer{text-align:center;color:var(--mu);font-size:12px;padding:20px 0 10px}
 </head>
 <body>
 <header class="top">
-  <div class="brand"><div class="logo">SH</div><div><h1>StreamHub API</h1><small>v8.2.7 · creator: shawon</small></div></div>
+  <div class="brand"><div class="logo">SH</div><div><h1>StreamHub API</h1><small>v8.2.8 · creator: shawon</small></div></div>
   <div class="search"><span style="opacity:.4;font-size:13px">⌕</span><input id="q" placeholder="Filter endpoints…" oninput="filt()"/></div>
 </header>
 <div class="tabs" id="tabs"></div>
