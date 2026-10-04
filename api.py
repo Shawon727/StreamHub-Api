@@ -1,4 +1,4 @@
-# StreamHub API v8.2.6 — creator: shawon
+# StreamHub API v8.2.7 — creator: shawon
 from __future__ import annotations
 
 import asyncio, base64, gzip, hashlib, hmac, json, random, re, time, uuid
@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response, StreamingResponse, PlainTextResponse
 
-CREATOR, VERSION = "shawon", "8.2.6"
+CREATOR, VERSION = "shawon", "8.2.7"
 app = FastAPI(title="StreamHub API", version=VERSION, docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -160,17 +160,118 @@ def _mb_dash_token(base: str, cookie: str) -> str:
     payload = json.dumps({"b": base.rstrip("/"), "c": cookie or ""}, separators=(",", ":")).encode()
     return base64.urlsafe_b64encode(payload).decode().rstrip("=")
 
-def _mb_proxy_mpd_url(base: str, cookie: str) -> str:
+def _mb_proxy_mpd_url(base: str, cookie: str, origin: str = "") -> str:
+    """Relative or absolute play_url for dash.js / VLC (cookie injected by /px)."""
     tok = _mb_dash_token(base, cookie)
-    return f"/px/{tok}/index.mpd"
+    rel = f"/px/{tok}/index.mpd"
+    if origin:
+        return origin.rstrip("/") + rel
+    return rel
+
+def _mb_proxy_seg_url(base: str, cookie: str, segment: str, origin: str = "") -> str:
+    """Map a CDN segment (absolute or relative to base) → /px/{tok}/<rel-to-base>."""
+    tok = _mb_dash_token(base, cookie)
+    base = (base or "").rstrip("/")
+    u = (segment or "").strip()
+    if not u:
+        return ""
+    if base and u.startswith(base):
+        rel = u[len(base):].lstrip("/")
+    elif u.startswith("http"):
+        # same-host path only; avoid duplicating /dash/... under base
+        try:
+            pu = urlparse(u)
+            bu = urlparse(base)
+            if pu.netloc == bu.netloc and pu.path.startswith(urlparse(base + "/").path.rstrip("/") + "/") or (pu.netloc == bu.netloc and base in u):
+                rel = u[len(base):].lstrip("/") if u.startswith(base) else pu.path.split("/")[-1]
+            else:
+                rel = pu.path.lstrip("/")
+                # if path still starts with same dash folder name as base tail, strip to relative
+                base_tail = base.split("/")[-1]
+                if base_tail and f"/{base_tail}/" in "/" + rel:
+                    rel = rel.split(f"{base_tail}/", 1)[-1]
+        except Exception:
+            rel = u.split("/")[-1]
+    else:
+        rel = u.lstrip("/")
+    path = f"/px/{tok}/{rel}"
+    if origin:
+        return origin.rstrip("/") + path
+    return path
 
 def _xml_local(tag: str) -> str:
     if not tag:
         return ""
     return tag.split("}")[-1] if "}" in tag else tag
 
-def _parse_mpd_reps(mpd_xml: str, base: str, cookie: str) -> list:
-    """Parse DASH MPD → list of representations with cookie-free play_url (via /px proxy)."""
+def _rewrite_mpd_for_proxy(mpd_xml: str, base: str, cookie: str) -> str:
+    """Rewrite MPD so every BaseURL / SegmentTemplate points at /px/{token}/… (absolute-path).
+    VLC and dash.js resolve segments relative to MPD URL correctly after this.
+    """
+    base = (base or "").rstrip("/")
+    if not base:
+        return mpd_xml
+    tok = _mb_dash_token(base, cookie)
+    px = f"/px/{tok}/"
+
+    def abs_url(u: str) -> str:
+        u = (u or "").strip()
+        if not u:
+            return u
+        if u.startswith("http"):
+            return u
+        if u.startswith("/"):
+            try:
+                p = urlparse(base)
+                return f"{p.scheme}://{p.netloc}{u}"
+            except Exception:
+                return base + u
+        return base + "/" + u.lstrip("/")
+
+    def to_px_path(u: str) -> str:
+        full = abs_url(u)
+        if base and full.startswith(base):
+            rel = full[len(base):].lstrip("/")
+        else:
+            try:
+                rel = urlparse(full).path.lstrip("/")
+                tail = base.split("/")[-1]
+                if tail and f"{tail}/" in rel:
+                    rel = rel.split(f"{tail}/", 1)[-1]
+            except Exception:
+                rel = full.split("/")[-1]
+        return px + rel
+
+    # Absolute BaseURL → relative path under /px (so player stays on API host)
+    def _bu(m):
+        inner = m.group(1).strip()
+        if inner.startswith("http"):
+            full = inner
+            if base and full.startswith(base):
+                rel = full[len(base):].lstrip("/") or "."
+            else:
+                try:
+                    rel = urlparse(full).path.lstrip("/")
+                except Exception:
+                    rel = "."
+            return f"<BaseURL>{rel}</BaseURL>" if rel else "<BaseURL>.</BaseURL>"
+        return m.group(0)
+
+    text = re.sub(r"<BaseURL>\s*([^<]+?)\s*</BaseURL>", _bu, mpd_xml)
+
+    # SegmentTemplate initialization / media attributes → keep relative (resolved via BaseURL)
+    # Ensure there is a Period-level BaseURL = "." so relative templates resolve under /px/tok/
+    if "<BaseURL>" not in text:
+        text = re.sub(
+            r"(<(?:\w+:)?Period[^>]*>)",
+            r'<BaseURL>.</BaseURL>',
+            text,
+            count=1,
+        )
+    return text
+
+def _parse_mpd_reps(mpd_xml: str, base: str, cookie: str, origin: str = "") -> list:
+    """Parse DASH MPD → representations. play_url is cookie-free via /px proxy."""
     import xml.etree.ElementTree as ET
     out = []
     try:
@@ -179,6 +280,7 @@ def _parse_mpd_reps(mpd_xml: str, base: str, cookie: str) -> list:
         return out
     base = (base or "").rstrip("/")
     tok = _mb_dash_token(base, cookie) if base else ""
+    play = _mb_proxy_mpd_url(base, cookie, origin) if base else None
 
     def abs_url(u: str) -> str:
         if not u:
@@ -186,31 +288,15 @@ def _parse_mpd_reps(mpd_xml: str, base: str, cookie: str) -> list:
         if u.startswith("http"):
             return u
         if u.startswith("/"):
-            # host from base
             try:
-                from urllib.parse import urlparse as _up
-                p = _up(base)
+                p = urlparse(base)
                 return f"{p.scheme}://{p.netloc}{u}"
             except Exception:
                 return base + u
         return base + "/" + u.lstrip("/")
 
-    def proxy(u: str) -> str:
-        if not u or not tok:
-            return u
-        # relative to base for /px
-        if base and u.startswith(base):
-            rel = u[len(base):].lstrip("/")
-        else:
-            rel = u
-            if "://" in u:
-                # full URL different host — still try path only
-                try:
-                    from urllib.parse import urlparse as _up
-                    rel = _up(u).path.lstrip("/")
-                except Exception:
-                    rel = u
-        return f"/px/{tok}/{rel}"
+    def proxy_path(u: str) -> str:
+        return _mb_proxy_seg_url(base, cookie, u, origin) if u else ""
 
     for period in root.iter():
         if _xml_local(period.tag) != "Period":
@@ -258,13 +344,14 @@ def _parse_mpd_reps(mpd_xml: str, base: str, cookie: str) -> list:
                 }
                 if init_tmpl:
                     init_u = abs_url(init_tmpl.replace("$RepresentationID$", rid).replace("$Bandwidth$", str(bw or "")))
-                    item["init_segment"] = init_u
-                    item["init_play"] = proxy(init_u)
+                    item["init_segment_cdn"] = init_u  # needs Edge-Cache-Cookie
+                    item["init_play"] = proxy_path(init_u)  # cookie-free via /px
                 if media_tmpl:
                     item["media_template"] = media_tmpl
                 # Full MPD play via proxy — works without client cookie
-                item["play_url"] = f"/px/{tok}/index.mpd" if tok else None
-                item["play_absolute_hint"] = "Prefix with your API origin. dash.js / VLC open play_url — cookie injected by server."
+                item["play_url"] = play
+                item["cdn_base"] = base
+                item["play_absolute_hint"] = "Open play_url (absolute if origin set) in VLC/dash.js — cookie injected by /px."
                 out.append(item)
     # de-dupe by id+bandwidth
     seen = set()
@@ -446,6 +533,7 @@ async def mb_play(subject_id: str, se: Optional[int] = None, ep: Optional[int] =
 
 @app.get("/mb/dash/extract", tags=["MovieBox"])
 async def mb_dash_extract(
+    request: Request,
     subject_id: str = Query(..., description="MovieBox subjectId"),
     se: Optional[int] = None,
     ep: Optional[int] = None,
@@ -454,10 +542,12 @@ async def mb_dash_extract(
     base: Optional[str] = Query(None, description="CDN base urlprefix decoded"),
 ):
     """
-    DASH link extractor — parses MPD representations and returns **cookie-free play_url**
-    (server-side /px proxy injects Edge-Cache-Cookie). Use play_url in dash.js / VLC.
-    Also returns each quality track from the MPD.
+    DASH extractor — cookie-free **absolute** play_url for VLC / dash.js.
+
+    Open `play_url` (full https://your-api/.../px/.../index.mpd) in VLC.
+    Server injects Edge-Cache-Cookie; do **not** paste CDN init-stream URLs into VLC without Cookie.
     """
+    origin = str(request.base_url).rstrip("/")
     streams_out = []
     title = None
     if subject_id and not mpd:
@@ -468,15 +558,15 @@ async def mb_dash_extract(
             path = f"/wefeed-mobile-bff/subject-api/play-info/v2?subjectId={subject_id}"
         data = await _mb_request("GET", path, token=tok)
         inner = _mb_unwrap(data)
-        title = inner.get("title")
+        title = inner.get("title") or inner.get("subjectName")
         for s in _mb_streams(data):
             if s.get("kind") != "dash":
-                # still list mp4 as already-direct
                 streams_out.append({
                     "source": "mp4",
                     "quality": s.get("quality"),
                     "url": s.get("url"),
                     "play_url": s.get("url"),
+                    "vlc_url": s.get("url"),
                     "kind": "mp4",
                     "codec": s.get("codec"),
                     "cookie_required": False,
@@ -484,23 +574,26 @@ async def mb_dash_extract(
                 continue
             b = s.get("base") or ""
             c = s.get("cookie") or ""
+            xml_err = None
+            reps = []
             try:
                 xml = await _mb_fetch_mpd(b, c)
-                reps = _parse_mpd_reps(xml, b, c)
+                reps = _parse_mpd_reps(xml, b, c, origin)
             except Exception as e:
-                reps = []
-                xml_err = str(e)
-            else:
-                xml_err = None
+                xml_err = str(e)[:200]
+            play = _mb_proxy_mpd_url(b, c, origin)
             streams_out.append({
                 "source": "dash",
                 "quality": s.get("quality"),
-                "codec": s.get("codec"),
-                "mpd": s.get("url"),
+                "codec": s.get("codec") or "h265",
+                "mpd_cdn": s.get("url"),
                 "base": b,
                 "cookie_required_on_client": False,
-                "play_url": _mb_proxy_mpd_url(b, c),
-                "play_how": "Open play_url on THIS API host (relative /px/...). Server adds cookie. Client needs NO cookie.",
+                "play_url": play,
+                "vlc_url": play,
+                "play_relative": _mb_proxy_mpd_url(b, c, ""),
+                "play_how": "Paste vlc_url / play_url into VLC Media → Open Network Stream. Do NOT open CDN init-stream*.m4s directly.",
+                "cdn_note": "Raw CDN URLs need Cookie: Edge-Cache-Cookie=... and will 403 without it.",
                 "representations": reps,
                 "representation_count": len(reps),
                 "error": xml_err,
@@ -513,12 +606,14 @@ async def mb_dash_extract(
         if c and not c.startswith("Edge-Cache-Cookie"):
             c = f"Edge-Cache-Cookie={c}"
         xml = await _mb_fetch_mpd(b, c)
-        reps = _parse_mpd_reps(xml, b, c)
+        reps = _parse_mpd_reps(xml, b, c, origin)
+        play = _mb_proxy_mpd_url(b, c, origin)
         streams_out.append({
             "source": "dash",
-            "mpd": b + "/index.mpd",
+            "mpd_cdn": b + "/index.mpd",
             "base": b,
-            "play_url": _mb_proxy_mpd_url(b, c),
+            "play_url": play,
+            "vlc_url": play,
             "cookie_required_on_client": False,
             "representations": reps,
             "representation_count": len(reps),
@@ -531,12 +626,16 @@ async def mb_dash_extract(
         "title": title,
         "dash_extractor": streams_out,
         "count": len(streams_out),
-        "how": "Use dash_extractor[].play_url — full URL = https://YOUR-API-HOST + play_url. No client Cookie header needed.",
+        "how": (
+            "1) Copy dash_extractor[].vlc_url (full https://…/px/…/index.mpd). "
+            "2) VLC → Media → Open Network Stream → paste. "
+            "3) Never open hakunaymatata.com init-stream*.m4s without Cookie."
+        ),
     }, provider="moviebox", level="primary", endpoint="dash_extract")
 
 @app.get("/mb/dash/extract/{subject_id}", tags=["MovieBox"])
-async def mb_dash_extract_path(subject_id: str, se: Optional[int] = None, ep: Optional[int] = None):
-    return await mb_dash_extract(subject_id=subject_id, se=se, ep=ep)
+async def mb_dash_extract_path(subject_id: str, request: Request, se: Optional[int] = None, ep: Optional[int] = None):
+    return await mb_dash_extract(request=request, subject_id=subject_id, se=se, ep=ep)
 
 @app.get("/mb/cdn/{subject_id}", tags=["MovieBox"])
 async def mb_cdn(subject_id: str, se: Optional[int] = None, ep: Optional[int] = None):
@@ -3158,14 +3257,15 @@ async def _proxy_fetch(request: Request, url: str, cookie: str = "", referer: st
             return Response(_rewrite_m3u8(text, str(r.url), cookie), media_type="application/vnd.apple.mpegurl",
                             headers={"Cache-Control": "no-store"})
         if dash_base:
-            def _bu(m):
-                u = m.group(1).strip()
-                if u.startswith(dash_base):
-                    rel = u[len(dash_base):].lstrip("/")
-                    return "<BaseURL>" + (rel or "./") + "</BaseURL>"
-                return m.group(0)
-            text = re.sub(r"<BaseURL>\s*(https?://[^<]+?)\s*</BaseURL>", _bu, text)
-        return Response(text, media_type="application/dash+xml", headers={"Cache-Control": "no-store"})
+            text = _rewrite_mpd_for_proxy(text, dash_base, cookie)
+        return Response(
+            text,
+            media_type="application/dash+xml",
+            headers={
+                "Cache-Control": "no-store",
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
     out_headers = {k: v for k, v in r.headers.items() if k.lower() in _PASS_HEADERS}
     out_headers.setdefault("Accept-Ranges", "bytes")
     out_headers["Cache-Control"] = "no-store"
@@ -3185,7 +3285,20 @@ async def px_dash(token: str, path: str, request: Request):
         raise HTTPException(400, detail=fail("Bad token"))
     if not base:
         raise HTTPException(400, detail=fail("Bad token"))
-    target = base + "/" + path
+    # path is relative to CDN base (e.g. index.mpd, init-stream1.m4s)
+    rel = (path or "").lstrip("/")
+    # If client accidentally passed full CDN path under base, strip duplicate
+    base_tail = base.split("/")[-1]
+    if base_tail and rel.startswith(base_tail + "/"):
+        rel = rel[len(base_tail) + 1:]
+    # Also strip if rel starts with full url path of base
+    try:
+        bp = urlparse(base).path.lstrip("/")
+        if bp and rel.startswith(bp + "/"):
+            rel = rel[len(bp) + 1:]
+    except Exception:
+        pass
+    target = base + "/" + rel
     if request.url.query:
         target += "?" + request.url.query
     return await _proxy_fetch(request, target, cookie=cookie, dash_base=base)
@@ -3251,7 +3364,7 @@ footer{text-align:center;color:var(--mu);font-size:12px;padding:20px 0 10px}
 </head>
 <body>
 <header class="top">
-  <div class="brand"><div class="logo">SH</div><div><h1>StreamHub API</h1><small>v8.2.6 · creator: shawon</small></div></div>
+  <div class="brand"><div class="logo">SH</div><div><h1>StreamHub API</h1><small>v8.2.7 · creator: shawon</small></div></div>
   <div class="search"><span style="opacity:.4;font-size:13px">⌕</span><input id="q" placeholder="Filter endpoints…" oninput="filt()"/></div>
 </header>
 <div class="tabs" id="tabs"></div>
