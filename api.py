@@ -1,4 +1,4 @@
-# StreamHub API v8.2.9 — creator: shawon
+# StreamHub API v8.3.0 — creator: shawon
 from __future__ import annotations
 
 import asyncio, base64, gzip, hashlib, hmac, json, random, re, time, uuid
@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response, StreamingResponse, PlainTextResponse
 
-CREATOR, VERSION = "shawon", "8.2.9"
+CREATOR, VERSION = "shawon", "8.3.0"
 app = FastAPI(title="StreamHub API", version=VERSION, docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -794,7 +794,12 @@ def _is_junk_cdn(u: str) -> bool:
     if not u:
         return True
     low = u.lower()
-    if "googleusercontent.com" in low or "lh3.google" in low:
+    # Real HubCloud file CDN lives on video-downloads.googleusercontent.com — keep it
+    if "video-downloads.googleusercontent.com" in low:
+        return False
+    if "lh3.googleusercontent.com" in low or "lh3.google" in low:
+        return True
+    if "googleusercontent.com" in low and "video-downloads" not in low:
         return True
     if "gstatic.com" in low or "/favicon" in low:
         return True
@@ -807,6 +812,8 @@ def _is_playable_direct(u: str) -> bool:
         return False
     low = u.lower()
     if "r2.cloudflarestorage.com" in low:
+        return True
+    if "video-downloads.googleusercontent.com" in low:
         return True
     if re.search(r"\.(mp4|mkv|webm|avi|m3u8)(\?|$)", low):
         return True
@@ -839,122 +846,151 @@ def _extract_cdn_urls(html):
     return found
 
 async def _follow_redirects_direct(url: str, referer: str = "https://hubcloud.ist/") -> Optional[str]:
-    """Follow redirects (gpdl → workers → signed CDN) without downloading body."""
+    """Follow redirects; extract link= query (HubCloud gpdl → google video CDN) without landing on HTML interstitial."""
     if not url:
         return None
     headers = {"User-Agent": UA, "Referer": referer, "Accept": "*/*"}
     current = url
     try:
         async with _client(25.0) as client:
-            for _ in range(8):
+            for _ in range(10):
+                # Prefer extracting embedded direct URL from intermediate pages
+                if "link=" in current and ("gamerxyt.com" in current or "dl.php" in current):
+                    q = dict(parse_qsl(urlparse(current).query))
+                    embedded = q.get("link") or q.get("url") or q.get("u")
+                    if embedded and embedded.startswith("http"):
+                        return embedded
                 r = await client.get(current, headers=headers, follow_redirects=False)
                 loc = r.headers.get("location") or r.headers.get("Location")
                 if r.status_code in (301, 302, 303, 307, 308) and loc:
-                    current = urljoin(current, loc)
+                    nxt = urljoin(current, loc)
+                    # HubCloud pattern: .../dl.php?link=https://video-downloads.googleusercontent.com/...
+                    if "link=" in nxt:
+                        q = dict(parse_qsl(urlparse(nxt).query))
+                        embedded = q.get("link") or q.get("url")
+                        if embedded and embedded.startswith("http"):
+                            return embedded
+                    current = nxt
+                    headers["Referer"] = str(r.url)
                     continue
-                # final non-redirect
                 ct = (r.headers.get("content-type") or "").lower()
-                if r.status_code in (200, 206) and (
-                    "video" in ct or "octet" in ct or "mpegurl" in ct or _is_playable_direct(str(r.url))
-                ):
-                    return str(r.url)
-                # still html gateway — try extract signed url from body
-                if "text/html" in ct and r.status_code == 200:
-                    body = r.text[:8000]
-                    for u in _extract_cdn_urls(body):
-                        if _is_playable_direct(u):
-                            return u
-                    # meta refresh
-                    m = re.search(r'url=([^"\'>\s]+)', body, re.I)
-                    if m and m.group(1).startswith("http"):
-                        current = m.group(1)
-                        continue
-                return current if _is_playable_direct(current) else None
+                final = str(r.url)
+                if r.status_code in (200, 206):
+                    if any(x in ct for x in ("video", "octet", "mpegurl", "matroska", "mp4", "stream")):
+                        return final
+                    if _is_playable_direct(final):
+                        return final
+                    # HTML page — scrape for signed CDN / google video downloads
+                    body = (r.text or "")[:12000]
+                    for pat in (
+                        r'https://video-downloads\.googleusercontent\.com/[^\s"\'<>]+',
+                        r'https://[a-f0-9]+\.r2\.cloudflarestorage\.com/[^\s"\'<>]+',
+                        r'https://[^\s"\'<>]+\.r2\.cloudflarestorage\.com/[^\s"\'<>]+',
+                    ):
+                        m = re.search(pat, body)
+                        if m:
+                            return m.group(0).replace("&amp;", "&")
+                    m = re.search(r'(?:href|data-url|data-href)\s*=\s*["\'](https?://[^"\']+)["\']', body, re.I)
+                    if m and _is_playable_direct(m.group(1)):
+                        return m.group(1)
+                return final if _is_playable_direct(final) else None
     except Exception:
         return None
     return current if _is_playable_direct(current) else None
 
 async def _resolve_gpdl(gpdl_url: str) -> list:
-    """Resolve HubCloud gpdl gateway → signed R2 / workers direct URL."""
+    """Resolve HubCloud gpdl → video-downloads.googleusercontent.com / R2 signed URL."""
     out = []
     final = await _follow_redirects_direct(gpdl_url, referer="https://hubcloud.ist/")
-    if final and final != gpdl_url:
+    # Also try workers host variants if first hop known
+    if not final and "gpdl.hubcloud.ist" in (gpdl_url or ""):
+        try:
+            async with _client(15.0) as client:
+                r = await client.get(gpdl_url, headers={"User-Agent": UA, "Referer": "https://hubcloud.ist/"}, follow_redirects=False)
+                loc = r.headers.get("location")
+                if loc:
+                    final = await _follow_redirects_direct(loc, referer=gpdl_url)
+        except Exception:
+            pass
+    if final and final != gpdl_url and not _is_junk_cdn(final):
+        # video-downloads.googleusercontent.com and r2 are real CDN
+        label = "Google CDN" if "googleusercontent.com" in final else ("R2 CDN" if "r2.cloudflare" in final else "CDN (resolved)")
         out.append({
-            "label": "CDN (resolved)",
+            "label": label,
             "url": final,
             "kind": "direct",
             "playable": True,
             "from": "gpdl",
         })
-    # Always offer server proxy as VLC-safe fallback (injects Referer)
-    out.append({
-        "label": "Proxy play (API)",
-        "url": "/gx?u=" + quote(gpdl_url, safe="") + "&c=",
-        "kind": "proxy",
-        "playable": True,
-        "note": "Streams via API with HubCloud Referer — use full https://YOUR-API + url",
-        "from": "gpdl",
-    })
-    if not final:
-        out.insert(0, {
-            "label": "GPDL gateway",
+    if not out:
+        out.append({
+            "label": "GPDL unresolved",
             "url": gpdl_url,
             "kind": "gateway",
             "playable": False,
-            "note": "Open in browser or use Proxy play",
+            "note": "Could not extract signed CDN — try /tools/resolve on this URL again later",
+            "from": "gpdl",
         })
     return out
 
 async def _resolve_pixeldrain(url_or_id: str, origin: str = "") -> list:
-    """Pixeldrain without hotlink block: try bypass hosts + API proxy."""
+    """Pixeldrain → direct file URL. Prefer official API with Referer (avoids hotlink on many IPs)."""
     fid = _pixeldrain_id(url_or_id)
     if not fid:
         return []
     results = []
-    # Official API (often hotlink-blocked for server IPs)
-    official = f"https://pixeldrain.com/api/file/{fid}?download"
-    # Community bypass mirrors (no hotlink check)
-    bypasses = [
-        f"https://pixeldrain-bypass.gamedrive.org/api/file/{fid}",
-        f"https://pixeldrain-bypass.gamedrive.org/{fid}",
-        f"https://pd.cybar.xyz/{fid}",
-        f"https://pixeldrain.dev/api/file/{fid}?download",
-    ]
     headers = {
         "User-Agent": UA,
         "Referer": f"https://pixeldrain.com/u/{fid}",
         "Accept": "*/*",
     }
+    meta = {}
+    official = f"https://pixeldrain.com/api/file/{fid}?download"
+    candidates = [
+        official,
+        f"https://pixeldrain.com/api/file/{fid}",
+        f"https://pixeldrain.dev/api/file/{fid}?download",
+        f"https://pixeldrain-bypass.gamedrive.org/api/file/{fid}",
+    ]
     picked = None
     try:
         async with _client(20.0) as client:
-            # info first
             try:
                 info = await client.get(f"https://pixeldrain.com/api/file/{fid}/info", headers=headers)
-                meta = info.json() if info.status_code == 200 else {}
+                if info.status_code == 200:
+                    meta = info.json() if "json" in (info.headers.get("content-type") or "") else {}
             except Exception:
-                meta = {}
-            for cand in bypasses + [official]:
+                pass
+            for cand in candidates:
                 try:
-                    r = await client.get(cand, headers=headers, follow_redirects=False)
-                    loc = r.headers.get("location")
-                    if r.status_code in (301, 302, 303, 307, 308) and loc:
-                        picked = urljoin(cand, loc)
-                        break
-                    if r.status_code in (200, 206):
-                        ct = (r.headers.get("content-type") or "").lower()
-                        # not JSON error
-                        if "json" in ct and b"hotlink" in (await r.aread())[:200]:
-                            continue
+                    r = await client.head(cand, headers=headers, follow_redirects=True)
+                    ct = (r.headers.get("content-type") or "").lower()
+                    # HTML interstitial / donation page
+                    if "text/html" in ct:
+                        continue
+                    if r.status_code in (200, 206) and any(x in ct for x in ("video", "octet", "matroska", "mp4", "stream", "binary")):
                         picked = str(r.url)
+                        break
+                    # some hosts disallow HEAD — try GET range
+                    r2 = await client.get(cand, headers={**headers, "Range": "bytes=0-64"}, follow_redirects=True)
+                    ct2 = (r2.headers.get("content-type") or "").lower()
+                    body = r2.content[:80] if r2.content else b""
+                    if b"hotlink" in body or (b"{" in body[:1] and b"hotlink" in body):
+                        continue
+                    if "text/html" in ct2:
+                        continue
+                    if r2.status_code in (200, 206) and (
+                        any(x in ct2 for x in ("video", "octet", "matroska", "mp4", "stream")) or body[:4] in (b"\x1aE\xdf\xa3", b"\x00\x00\x00") or len(body) > 0
+                    ):
+                        # mkv often starts with EBML 1A45DFA3
+                        picked = str(r2.url)
                         break
                 except Exception:
                     continue
     except Exception:
-        meta = {}
-        picked = None
+        pass
 
-    if picked and "hotlink" not in picked:
+    if picked:
         results.append({
             "label": "PixelDrain CDN",
             "url": picked,
@@ -963,8 +999,19 @@ async def _resolve_pixeldrain(url_or_id: str, origin: str = "") -> list:
             "file_id": fid,
             "name": (meta or {}).get("name"),
             "size": (meta or {}).get("size"),
+            "mime": (meta or {}).get("mime_type"),
         })
-    # Always add our proxy endpoint (works when mirrors fail)
+    # Official URL still useful for clients that send browser Referer
+    results.append({
+        "label": "PixelDrain API",
+        "url": official,
+        "kind": "direct",
+        "playable": True,
+        "file_id": fid,
+        "note": "Works in VLC/browser with Referer https://pixeldrain.com/u/" + fid,
+        "name": (meta or {}).get("name"),
+        "size": (meta or {}).get("size"),
+    })
     proxy_path = f"/tools/pixeldrain/stream?id={fid}"
     if origin:
         proxy_path = origin.rstrip("/") + proxy_path
@@ -974,7 +1021,7 @@ async def _resolve_pixeldrain(url_or_id: str, origin: str = "") -> list:
         "kind": "proxy",
         "playable": True,
         "file_id": fid,
-        "note": "Streams through this API — no hotlink error in VLC",
+        "note": "Streams bytes through this API (server adds Referer)",
     })
     results.append({
         "label": "PixelDrain page",
@@ -1200,33 +1247,48 @@ async def tools_pixeldrain(request: Request, id: str = Query(...)):
 
 @app.get("/tools/pixeldrain/stream", tags=["Tools"], include_in_schema=True)
 async def tools_pixeldrain_stream(request: Request, id: str = Query(...)):
-    """Proxy Pixeldrain file with browser-like Referer — no hotlink error."""
+    """Proxy Pixeldrain file with browser-like Referer — returns real video bytes, not HTML."""
     fid = _pixeldrain_id(id)
     if not fid:
         raise HTTPException(400, detail=fail("Invalid pixeldrain id"))
     targets = [
-        f"https://pixeldrain-bypass.gamedrive.org/api/file/{fid}",
         f"https://pixeldrain.com/api/file/{fid}?download",
-        f"https://pixeldrain.dev/api/file/{fid}?download",
         f"https://pixeldrain.com/api/file/{fid}",
+        f"https://pixeldrain.dev/api/file/{fid}?download",
+        f"https://pixeldrain-bypass.gamedrive.org/api/file/{fid}",
     ]
-    headers = {
-        "User-Agent": UA,
-        "Referer": f"https://pixeldrain.com/u/{fid}",
-        "Accept": "*/*",
-    }
+    ref = f"https://pixeldrain.com/u/{fid}"
     last_err = None
     for target in targets:
         try:
-            return await _proxy_fetch(
-                request, target,
-                cookie="",
-                referer=f"https://pixeldrain.com/u/{fid}",
-            )
+            # Probe content-type first so we don't stream a donation HTML page
+            async with _client(20.0) as client:
+                h = {"User-Agent": UA, "Referer": ref, "Accept": "*/*"}
+                try:
+                    pr = await client.head(target, headers=h, follow_redirects=True)
+                    ct = (pr.headers.get("content-type") or "").lower()
+                    if "text/html" in ct:
+                        continue
+                except Exception:
+                    pass
+            return await _proxy_fetch(request, target, cookie="", referer=ref)
         except Exception as e:
             last_err = e
             continue
     raise HTTPException(502, detail=fail("Pixeldrain upstream failed", detail=str(last_err)[:160] if last_err else None))
+
+@app.get("/tools/gpdl", tags=["Tools"])
+async def tools_gpdl(request: Request, url: str = Query(..., description="gpdl.hubcloud.ist/?id=... URL")):
+    """Resolve HubCloud gpdl gateway → direct video-downloads.googleusercontent.com / R2 CDN."""
+    links = await _resolve_gpdl(url.strip())
+    playable = [x for x in links if x.get("playable") and x.get("kind") == "direct"]
+    return ok({
+        "input": url,
+        "links": links,
+        "direct_url": playable[0]["url"] if playable else None,
+        "play_url": playable[0]["url"] if playable else None,
+        "how": "Use direct_url in VLC Media → Open Network Stream",
+    }, provider="tools", level="tool", endpoint="gpdl")
 
 
 @app.get("/tools/mp4", tags=["Tools"])
@@ -3587,7 +3649,7 @@ footer{text-align:center;color:var(--mu);font-size:12px;padding:20px 0 10px}
 </head>
 <body>
 <header class="top">
-  <div class="brand"><div class="logo">SH</div><div><h1>StreamHub API</h1><small>v8.2.9 · creator: shawon</small></div></div>
+  <div class="brand"><div class="logo">SH</div><div><h1>StreamHub API</h1><small>v8.3.0 · creator: shawon</small></div></div>
   <div class="search"><span style="opacity:.4;font-size:13px">⌕</span><input id="q" placeholder="Filter endpoints…" oninput="filt()"/></div>
 </header>
 <div class="tabs" id="tabs"></div>
