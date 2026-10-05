@@ -1,4 +1,4 @@
-# StreamHub API v8.3.2 — creator: shawon
+# StreamHub API v8.3.3 — creator: shawon
 from __future__ import annotations
 
 import asyncio, base64, gzip, hashlib, hmac, json, random, re, time, uuid
@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response, StreamingResponse, PlainTextResponse
 
-CREATOR, VERSION = "shawon", "8.3.2"
+CREATOR, VERSION = "shawon", "8.3.3"
 app = FastAPI(title="StreamHub API", version=VERSION, docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -1263,93 +1263,154 @@ async def tools_resolve(request: Request, url: str = Query(...)):
         return fail(str(e), provider="tools", endpoint="resolve", input=u)
     return ok({"input": u, "links": links, "count": len(links)}, provider="tools", level="tool", endpoint="resolve")
 
-@app.get("/tools/pixeldrain", tags=["Tools"])
+@app.api_route("/tools/pixeldrain", methods=["GET", "HEAD"], tags=["Tools"])
 async def tools_pixeldrain(request: Request, id: str = Query(...)):
-    """Resolve Pixeldrain id → eu.cc CDN entry (browser follows redirect; avoids hotlink_detected)."""
+    """Pixeldrain id → final playable CDN URL (resolved) + VLC-safe links."""
     origin = str(request.base_url).rstrip("/")
-    fid = _pixeldrain_id(id) or id.strip()
-    links = await _resolve_pixeldrain(fid, origin=origin)
-    # Prefer stable entry URL (cdn.pixeldrain.eu.cc) over resolved cdnNN node —
-    # opening cdnNN directly can hotlink-block on some ISPs; entry redirect is safer.
-    entry = f"https://cdn.pixeldrain.eu.cc/{fid}?download"
-    entry2 = f"https://cdn.pixeldrain.eu.cc/{fid}"
-    playable = [x for x in links if x.get("playable") and x.get("kind") == "direct"]
-    # put entry first in response
-    best = entry
-    name = None
-    size = None
-    mime = None
-    for x in playable:
-        name = name or x.get("name")
-        size = size or x.get("size")
-        mime = mime or x.get("mime")
-    return ok({
-        "id": fid,
-        "name": name,
-        "size": size,
-        "mime": mime or "video/x-matroska",
-        "links": links,
-        "play_url": best,
-        "direct_url": best,
-        "download_url": best,
-        "mirror": entry,
-        "mirror_alt": entry2,
-        "redirect_url": origin + f"/tools/pixeldrain/go?id={fid}",
-        "proxy_url": origin + f"/tools/pixeldrain/stream?id={fid}",
-        "page": f"https://pixeldrain.com/u/{fid}",
-        "browser_note": (
-            "Chrome/Safari cannot play .mkv/HEVC in the built-in video player. "
-            "Use VLC / MX Player / 1DM with play_url or redirect_url. "
-            "proxy_url is for download managers / VLC network stream."
-        ),
-        "how": (
-            "1) VLC → Media → Open Network Stream → paste play_url (cdn.pixeldrain.eu.cc/…). "
-            "2) Or open redirect_url in browser (302 to eu.cc). "
-            "3) Never use pixeldrain.com/api/file/…?download from apps — hotlink_detected. "
-            "4) Opening cdnNN.pixeldrain.eu.cc/... directly may also hotlink on some networks — use the entry URL."
-        ),
-    }, provider="tools", level="tool", endpoint="pixeldrain")
-
-@app.get("/tools/pixeldrain/go", tags=["Tools"])
-async def tools_pixeldrain_go(id: str = Query(...)):
-    """302 redirect to cdn.pixeldrain.eu.cc entry — client IP follows redirects (best for hotlink)."""
     fid = _pixeldrain_id(id) or id.strip()
     if not fid:
         raise HTTPException(400, detail=fail("Invalid pixeldrain id"))
-    from fastapi.responses import RedirectResponse
-    return RedirectResponse(
-        url=f"https://cdn.pixeldrain.eu.cc/{fid}?download",
-        status_code=302,
-        headers={"Referrer-Policy": "no-referrer"},
-    )
 
-@app.get("/tools/pixeldrain/stream", tags=["Tools"], include_in_schema=True)
+    entry = f"https://cdn.pixeldrain.eu.cc/{fid}?download"
+    final_url = None
+    meta_name = meta_size = meta_mime = None
+
+    # Resolve final node (cdnNN.pixeldrain.eu.cc/api/file/ID) — single hop for VLC
+    try:
+        picked = await _pixeldrain_pick_direct(fid)
+        if picked:
+            final_url = picked.get("url")
+            meta_mime = picked.get("content_type")
+    except Exception:
+        picked = None
+
+    if not final_url:
+        try:
+            async with _client(18.0) as client:
+                r = await client.get(
+                    entry,
+                    headers={"User-Agent": UA, "Referer": f"https://pixeldrain.com/u/{fid}", "Accept": "*/*", "Range": "bytes=0-0"},
+                    follow_redirects=True,
+                )
+                ct = (r.headers.get("content-type") or "").lower()
+                if "hotlink" not in (r.content or b"")[:80] and "text/html" not in ct:
+                    final_url = str(r.url)
+                    meta_mime = ct or meta_mime
+        except Exception:
+            pass
+
+    try:
+        async with _client(10.0) as client:
+            info = await client.get(f"https://pixeldrain.com/api/file/{fid}/info", headers={"User-Agent": UA})
+            if info.status_code == 200 and "json" in (info.headers.get("content-type") or ""):
+                meta = info.json()
+                meta_name = meta.get("name")
+                meta_size = meta.get("size")
+                meta_mime = meta_mime or meta.get("mime_type")
+    except Exception:
+        pass
+
+    if not final_url:
+        final_url = entry
+
+    # gx proxy URL (our server streams with Range — best for mobile VLC when direct fails)
+    gx = origin + "/gx?u=" + quote(final_url, safe="") + "&c="
+    stream = origin + f"/tools/pixeldrain/stream?id={fid}"
+    go = origin + f"/tools/pixeldrain/go?id={fid}"
+
+    links = [
+        {"label": "Final CDN (1 hop)", "url": final_url, "kind": "direct", "playable": True},
+        {"label": "EU.CC entry", "url": entry, "kind": "direct", "playable": True},
+        {"label": "API gx proxy", "url": gx, "kind": "proxy", "playable": True},
+        {"label": "API stream", "url": stream, "kind": "proxy", "playable": True},
+        {"label": "Page", "url": f"https://pixeldrain.com/u/{fid}", "kind": "page", "playable": False},
+    ]
+
+    return ok({
+        "id": fid,
+        "name": meta_name,
+        "size": meta_size,
+        "mime": meta_mime or "video/x-matroska",
+        "final_url": final_url,
+        "play_url": final_url,
+        "direct_url": final_url,
+        "download_url": final_url,
+        "entry_url": entry,
+        "redirect_url": go,
+        "proxy_url": stream,
+        "gx_url": gx,
+        "links": links,
+        "vlc": {
+            "best": final_url,
+            "fallback": gx,
+            "steps": [
+                "Open VLC → Network stream",
+                "Paste final_url (cdnNN.pixeldrain.eu.cc/api/file/...)",
+                "If black screen: file is HEVC/x265 — need device HEVC decoder, or try gx_url proxy",
+            ],
+        },
+        "browser_note": "Browser cannot play MKV/HEVC. Use VLC / MX Player / 1DM.",
+        "how": (
+            "VLC best: open final_url (already resolved, no double redirect). "
+            "If that fails on your network: open gx_url or proxy_url (streams via API). "
+            "Do not use pixeldrain.com/api/file/?download — hotlink_detected."
+        ),
+    }, provider="tools", level="tool", endpoint="pixeldrain")
+
+
+@app.api_route("/tools/pixeldrain/go", methods=["GET", "HEAD"], tags=["Tools"])
+async def tools_pixeldrain_go(id: str = Query(...)):
+    """Resolve → single 302 to final cdnNN node (VLC-friendly, no double redirect)."""
+    from fastapi.responses import RedirectResponse
+    fid = _pixeldrain_id(id) or (id or "").strip()
+    if not fid:
+        raise HTTPException(400, detail=fail("Invalid pixeldrain id"))
+    final_url = None
+    try:
+        picked = await _pixeldrain_pick_direct(fid)
+        if picked:
+            final_url = picked.get("url")
+    except Exception:
+        pass
+    if not final_url:
+        try:
+            async with _client(18.0) as client:
+                r = await client.get(
+                    f"https://cdn.pixeldrain.eu.cc/{fid}?download",
+                    headers={"User-Agent": UA, "Referer": f"https://pixeldrain.com/u/{fid}", "Range": "bytes=0-0"},
+                    follow_redirects=True,
+                )
+                body = (r.content or b"")[:100]
+                ct = (r.headers.get("content-type") or "").lower()
+                if b"hotlink" not in body and "text/html" not in ct and r.status_code < 400:
+                    final_url = str(r.url)
+        except Exception:
+            pass
+    if not final_url:
+        final_url = f"https://cdn.pixeldrain.eu.cc/{fid}?download"
+    return RedirectResponse(url=final_url, status_code=302, headers={"Referrer-Policy": "no-referrer"})
+
+
+@app.api_route("/tools/pixeldrain/stream", methods=["GET", "HEAD"], tags=["Tools"], include_in_schema=True)
 async def tools_pixeldrain_stream(request: Request, id: str = Query(...)):
-    """
-    Stream Pixeldrain bytes via eu.cc mirrors.
-    Use in VLC (network stream) or download managers — NOT Chrome <video> (MKV unsupported).
-    """
+    """Proxy stream with Range — VLC/MX Player network stream target."""
     fid = _pixeldrain_id(id)
     if not fid:
         raise HTTPException(400, detail=fail("Invalid pixeldrain id"))
 
-    targets = [
-        f"https://cdn.pixeldrain.eu.cc/{fid}?download",
-        f"https://cdn.pixeldrain.eu.cc/{fid}",
-        f"https://cdn.pixeldrain.eu.cc/api/file/{fid}",
-    ]
-    # optional resolved node
+    targets = []
     try:
         picked = await _pixeldrain_pick_direct(fid)
         if picked and picked.get("url"):
-            targets.insert(0, picked["url"])
+            targets.append(picked["url"])
     except Exception:
         pass
     targets.extend([
-        f"https://pd1.sriflix.my/api/file/{fid}?download",
+        f"https://cdn.pixeldrain.eu.cc/{fid}?download",
+        f"https://cdn.pixeldrain.eu.cc/{fid}",
+        f"https://cdn.pixeldrain.eu.cc/api/file/{fid}",
         f"https://pixeldrain.com/api/file/{fid}?download",
     ])
-
     ref = f"https://cdn.pixeldrain.eu.cc/{fid}"
     last_err = None
     seen = set()
@@ -1361,35 +1422,23 @@ async def tools_pixeldrain_stream(request: Request, id: str = Query(...)):
             async with _client(20.0) as client:
                 pr = await client.get(
                     target,
-                    headers={
-                        "User-Agent": UA,
-                        "Referer": ref,
-                        "Accept": "*/*",
-                        "Range": "bytes=0-256",
-                    },
+                    headers={"User-Agent": UA, "Referer": ref, "Accept": "*/*", "Range": "bytes=0-64"},
                     follow_redirects=True,
                 )
                 ct = (pr.headers.get("content-type") or "").lower()
-                body = pr.content[:100] if pr.content else b""
-                if "text/html" in ct or b"hotlink" in body or (
-                    body[:1] == b"{" and b"hotlink" in body
-                ):
+                body = pr.content[:80] if pr.content else b""
+                if "text/html" in ct or b"hotlink" in body or (body[:1] == b"{" and b"hotlink" in body):
                     continue
                 if pr.status_code not in (200, 206):
                     continue
                 final_url = str(pr.url)
-            # Full proxy stream of final_url
             return await _proxy_fetch(request, final_url, cookie="", referer=ref)
         except Exception as e:
             last_err = e
             continue
-
-    # Last resort: 302 client to eu.cc (their IP, not ours)
+    # Client-side fallback
     from fastapi.responses import RedirectResponse
-    return RedirectResponse(
-        url=f"https://cdn.pixeldrain.eu.cc/{fid}?download",
-        status_code=302,
-    )
+    return RedirectResponse(url=f"https://cdn.pixeldrain.eu.cc/{fid}?download", status_code=302)
 
 @app.get("/tools/gpdl", tags=["Tools"])
 async def tools_gpdl(request: Request, url: str = Query(..., description="gpdl.hubcloud.ist/?id=... URL")):
@@ -3763,7 +3812,7 @@ footer{text-align:center;color:var(--mu);font-size:12px;padding:20px 0 10px}
 </head>
 <body>
 <header class="top">
-  <div class="brand"><div class="logo">SH</div><div><h1>StreamHub API</h1><small>v8.3.2 · creator: shawon</small></div></div>
+  <div class="brand"><div class="logo">SH</div><div><h1>StreamHub API</h1><small>v8.3.3 · creator: shawon</small></div></div>
   <div class="search"><span style="opacity:.4;font-size:13px">⌕</span><input id="q" placeholder="Filter endpoints…" oninput="filt()"/></div>
 </header>
 <div class="tabs" id="tabs"></div>
