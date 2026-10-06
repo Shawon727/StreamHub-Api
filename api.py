@@ -1,4 +1,4 @@
-# StreamHub API v8.4.1 — creator: shawon
+# StreamHub API v8.4.2 — creator: shawon
 from __future__ import annotations
 
 import asyncio, base64, gzip, hashlib, hmac, json, random, re, time, uuid
@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response, StreamingResponse, PlainTextResponse
 
-CREATOR, VERSION = "shawon", "8.4.1"
+CREATOR, VERSION = "shawon", "8.4.2"
 app = FastAPI(title="StreamHub API", version=VERSION, docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -4160,22 +4160,27 @@ async def og_stream(
     }, provider="ogpirate", endpoint="stream")
 
 
-# ========== CRICBUZZ (live cricket scores) ==========
+# ========== CRICBUZZ (full scrape: live / score / scorecard / commentary / table) ==========
 CB_BASE = "https://www.cricbuzz.com"
 CB_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
 async def _cb_html(path: str) -> str:
     url = path if path.startswith("http") else (CB_BASE + path)
-    async with _client(22.0) as client:
+    async with _client(25.0) as client:
         r = await client.get(url, headers={
             "User-Agent": CB_UA,
-            "Accept": "text/html,application/xhtml+xml",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
             "Referer": CB_BASE + "/",
+            "Cache-Control": "no-cache",
         })
         if r.status_code >= 400:
-            raise HTTPException(502, detail=fail("Cricbuzz fetch failed", status=r.status_code))
+            raise HTTPException(502, detail=fail("Cricbuzz fetch failed", status=r.status_code, url=url))
         return r.text
+
+def _cb_slug_from_href(href: str) -> str:
+    m = re.search(r"/live-cricket-scores/\d+/([^/?#]+)", href or "")
+    return m.group(1) if m else ""
 
 def _cb_parse_live_list(html: str) -> list:
     soup = BeautifulSoup(html, "html.parser")
@@ -4193,11 +4198,19 @@ def _cb_parse_live_list(html: str) -> list:
         title = a.get_text(" ", strip=True)
         if not title or len(title) < 3:
             continue
+        # parent card text often has score line
+        parent = a.find_parent(["div", "li", "article"])
+        card = parent.get_text(" ", strip=True) if parent else title
+        # extract simple score patterns Team 123/4
+        scores = re.findall(r"([A-Z][A-Za-z0-9 ]{1,20}?)\s+(\d{1,3}/\d{1,2}|\d{1,3})\s*(?:\(([^)]+)\))?", card)
         items.append({
             "match_id": mid,
             "title": title,
+            "card_text": card[:220],
+            "slug": _cb_slug_from_href(href),
             "url": CB_BASE + href if href.startswith("/") else href,
             "path": href,
+            "score_hints": [{"team": s[0].strip(), "score": s[1], "overs": s[2] or None} for s in scores[:4]],
         })
     return items
 
@@ -4209,56 +4222,408 @@ def _cb_parse_match(html: str, match_id: str) -> dict:
         title = og["content"]
     if not title and soup.title:
         title = soup.title.get_text(strip=True)
-    # score-ish text blocks
-    texts = []
-    for sel in [".cb-min-bat-rw", ".cb-text-live", ".cb-text-complete", ".cb-scrcrd-status",
-                ".cb-col.cb-col-100.cb-min-tm", ".cb-min-hdr-rw", "h1", "h2"]:
+    h1 = soup.select_one("h1")
+    if h1 and not title:
+        title = h1.get_text(" ", strip=True)
+    # status / result
+    status_lines = []
+    for sel in [
+        "h1", "h2",
+        "[class*='cb-text-live']", "[class*='cb-text-complete']",
+        "[class*='text-cbLive']", "[class*='match-status']",
+    ]:
         for el in soup.select(sel):
             tx = el.get_text(" ", strip=True)
-            if tx and tx not in texts and len(tx) < 200:
-                texts.append(tx)
-    # batsmen / bowlers tables rough
-    tables = []
-    for table in soup.select("table")[:6]:
-        rows = []
-        for tr in table.select("tr")[:20]:
-            cells = [c.get_text(" ", strip=True) for c in tr.select("th,td")]
-            if any(cells):
-                rows.append(cells)
-        if rows:
-            tables.append(rows)
-    status = texts[0] if texts else ""
+            if tx and len(tx) < 240 and tx not in status_lines:
+                status_lines.append(tx)
+    # raw score-looking fragments from body text
+    body = soup.get_text("\n", strip=True)
+    score_lines = []
+    for line in body.split("\n"):
+        line = line.strip()
+        if not line or len(line) > 120:
+            continue
+        if re.search(r"\d{1,3}/\d{1,2}", line) or re.search(r"won by|opt to|need \d+|trail by", line, re.I):
+            if line not in score_lines:
+                score_lines.append(line)
+        if len(score_lines) >= 15:
+            break
+    status = ""
+    for s in status_lines + score_lines:
+        if re.search(r"won by|live|opt to|innings break|stumps|abandoned|no result", s, re.I):
+            status = s
+            break
+    if not status and score_lines:
+        status = score_lines[0]
     return {
         "match_id": match_id,
         "title": title,
-        "status_lines": texts[:12],
         "status": status,
-        "tables": tables[:4],
+        "status_lines": status_lines[:12],
+        "score_lines": score_lines[:12],
         "url": f"{CB_BASE}/live-cricket-scores/{match_id}",
-        "note": "Scraped from Cricbuzz HTML — layout may change",
+        "scorecard_url": f"{CB_BASE}/live-cricket-scorecard/{match_id}",
+        "commentary_url": f"{CB_BASE}/cricket-full-commentary/{match_id}",
+        "note": "HTML scrape — use /cb/scorecard and /cb/commentary for full tables",
     }
+
+def _cb_grid_rows(soup, class_name: str) -> list:
+    """Parse CSS-grid scorecard rows (Batter/Bowler/FOW)."""
+    rows = []
+    for el in soup.select(f".{class_name}"):
+        # grid children text cells
+        cells = []
+        # get direct text chunks
+        raw = el.get_text("\n", strip=True)
+        parts = [p.strip() for p in raw.split("\n") if p.strip()]
+        # filter noise
+        noise = {"View match performance", "View profile", "Batter", "Bowler", "R", "B", "4s", "6s", "SR",
+                 "O", "M", "W", "NB", "WD", "ECO", "Fall of Wickets", "Score", "Over"}
+        parts = [p for p in parts if p not in noise]
+        if not parts:
+            continue
+        # batting row heuristic: name, dismissal, R B 4s 6s SR
+        nums = [p for p in parts if re.match(r"^[\d.]+$", p)]
+        texts = [p for p in parts if not re.match(r"^[\d.]+$", p)]
+        if "bat" in class_name:
+            if len(nums) >= 5 and texts:
+                rows.append({
+                    "name": texts[0],
+                    "dismissal": " ".join(texts[1:]) if len(texts) > 1 else "",
+                    "r": nums[0], "b": nums[1], "fours": nums[2], "sixes": nums[3], "sr": nums[4],
+                })
+            elif texts:
+                rows.append({"name": texts[0], "raw": parts})
+        elif "bowl" in class_name:
+            if len(nums) >= 6 and texts:
+                rows.append({
+                    "name": texts[0],
+                    "o": nums[0], "m": nums[1], "r": nums[2], "w": nums[3],
+                    "nb": nums[4], "wd": nums[5], "eco": nums[6] if len(nums) > 6 else None,
+                })
+            elif texts:
+                rows.append({"name": texts[0], "raw": parts})
+        elif "fow" in class_name:
+            if len(parts) >= 2:
+                rows.append({"label": parts[0], "score": parts[1] if len(parts) > 1 else None,
+                             "over": parts[2] if len(parts) > 2 else None, "raw": parts})
+        else:
+            rows.append({"raw": parts})
+    return rows
+
+def _cb_parse_scorecard(html: str, match_id: str) -> dict:
+    soup = BeautifulSoup(html, "html.parser")
+    title = ""
+    h1 = soup.select_one("h1")
+    if h1:
+        title = h1.get_text(" ", strip=True)
+    elif soup.title:
+        title = soup.title.get_text(strip=True)
+    batting = _cb_grid_rows(soup, "scorecard-bat-grid")
+    bowling = _cb_grid_rows(soup, "scorecard-bowl-grid")
+    fow = _cb_grid_rows(soup, "scorecard-fow-grid")
+    # also try classic table markup if grids empty
+    tables = []
+    if not batting:
+        for table in soup.select("table")[:8]:
+            rows = []
+            for tr in table.select("tr"):
+                cells = [c.get_text(" ", strip=True) for c in tr.select("th,td")]
+                if any(cells):
+                    rows.append(cells)
+            if rows:
+                tables.append(rows)
+    # innings labels near grids
+    innings_labels = []
+    for el in soup.find_all(["h2", "h3", "h4", "div"]):
+        tx = el.get_text(" ", strip=True)
+        if re.search(r"innings|Innings", tx) and len(tx) < 80:
+            if tx not in innings_labels:
+                innings_labels.append(tx)
+    return {
+        "match_id": match_id,
+        "title": title,
+        "innings_labels": innings_labels[:8],
+        "batting": batting,
+        "bowling": bowling,
+        "fall_of_wickets": fow,
+        "tables": tables[:6],
+        "batting_count": len(batting),
+        "bowling_count": len(bowling),
+        "url": f"{CB_BASE}/live-cricket-scorecard/{match_id}",
+    }
+
+def _cb_parse_commentary(html: str, match_id: str) -> dict:
+    soup = BeautifulSoup(html, "html.parser")
+    title = ""
+    h1 = soup.select_one("h1")
+    if h1:
+        title = h1.get_text(" ", strip=True)
+    body = soup.get_text("\n", strip=True)
+    lines = [l.strip() for l in body.split("\n") if l.strip()]
+    events = []
+    i = 0
+    while i < len(lines) and len(events) < 80:
+        line = lines[i]
+        # over.ball marker
+        if re.match(r"^\d{1,3}\.\d$", line):
+            ball = line
+            bits = []
+            j = i + 1
+            while j < len(lines) and j < i + 6:
+                nxt = lines[j]
+                if re.match(r"^\d{1,3}\.\d$", nxt):
+                    break
+                bits.append(nxt)
+                j += 1
+            events.append({"over_ball": ball, "text": " · ".join(bits)[:300]})
+            i = j
+            continue
+        # FOUR / SIX / OUT lines
+        if re.search(r"\b(FOUR|SIX|OUT|Wicket|wide|no ball)\b", line, re.I) and len(line) < 200:
+            events.append({"over_ball": None, "text": line})
+        i += 1
+    # also pull any comment-like divs
+    for el in soup.select("[class*='comm'], [class*='Comm'], [class*='commentary']")[:40]:
+        tx = el.get_text(" ", strip=True)
+        if tx and len(tx) > 8 and len(tx) < 320:
+            if not any(tx == e.get("text") for e in events):
+                events.append({"over_ball": None, "text": tx})
+    return {
+        "match_id": match_id,
+        "title": title,
+        "events": events[:60],
+        "count": len(events[:60]),
+        "url": f"{CB_BASE}/cricket-full-commentary/{match_id}",
+        "note": "Best-effort HTML scrape; live ball-by-ball may be client-rendered",
+    }
+
+def _cb_parse_points_table(html: str) -> dict:
+    soup = BeautifulSoup(html, "html.parser")
+    title = soup.title.get_text(strip=True) if soup.title else ""
+    rows = []
+    # try any table
+    for table in soup.select("table"):
+        for tr in table.select("tr"):
+            cells = [c.get_text(" ", strip=True) for c in tr.select("th,td")]
+            if any(cells):
+                rows.append(cells)
+    # div-based standings
+    if not rows:
+        body = soup.get_text("\n", strip=True)
+        for line in body.split("\n"):
+            line = line.strip()
+            # Team  P  W  L  Pts pattern rough
+            if re.search(r"\bPts\b|\bNRR\b|\bPoints\b", line) or re.match(r"^[A-Za-z ].+\s+\d+\s+\d+\s+\d+", line):
+                rows.append([line])
+            if len(rows) >= 40:
+                break
+    return {"title": title, "rows": rows[:50], "count": len(rows)}
 
 @app.get("/cb/live", tags=["Cricbuzz"])
 async def cb_live():
-    """List live / recent matches from Cricbuzz live-scores page."""
+    """Live + recent matches from Cricbuzz."""
     html = await _cb_html("/cricket-match/live-scores")
     items = _cb_parse_live_list(html)
-    return ok({"items": items, "count": len(items), "source": CB_BASE + "/cricket-match/live-scores"},
-              provider="cricbuzz", endpoint="live",
-              how="Use match_id with /cb/score?id=MATCH_ID")
+    # merge homepage extras
+    try:
+        home = await _cb_html("/")
+        for it in _cb_parse_live_list(home):
+            if not any(x["match_id"] == it["match_id"] for x in items):
+                items.append(it)
+    except Exception:
+        pass
+    return ok({
+        "items": items, "count": len(items),
+        "source": CB_BASE + "/cricket-match/live-scores",
+    }, provider="cricbuzz", endpoint="live",
+       how="Pick match_id → /cb/score?id= · /cb/scorecard?id= · /cb/commentary?id=")
 
 @app.get("/cb/score", tags=["Cricbuzz"])
-async def cb_score(id: str = Query(..., description="Cricbuzz match id from /cb/live")):
-    """Match page scrape — title, status lines, score tables."""
+async def cb_score(id: str = Query(..., description="Cricbuzz match id e.g. 174057")):
+    """Match summary: title, status, score lines."""
     mid = re.sub(r"\D", "", id) or id
     html = await _cb_html(f"/live-cricket-scores/{mid}")
-    data = _cb_parse_match(html, mid)
-    return ok(data, provider="cricbuzz", endpoint="score")
+    return ok(_cb_parse_match(html, mid), provider="cricbuzz", endpoint="score",
+              how="Full batting/bowling → /cb/scorecard?id=" + mid)
 
 @app.get("/cb/match", tags=["Cricbuzz"])
 async def cb_match(id: str = Query(...)):
     """Alias of /cb/score."""
     return await cb_score(id)
+
+@app.get("/cb/scorecard", tags=["Cricbuzz"])
+async def cb_scorecard(id: str = Query(..., description="Match id")):
+    """Full scorecard: batting, bowling, fall of wickets."""
+    mid = re.sub(r"\D", "", id) or id
+    # try with and without slug path
+    html = await _cb_html(f"/live-cricket-scorecard/{mid}")
+    data = _cb_parse_scorecard(html, mid)
+    if data["batting_count"] == 0 and data["bowling_count"] == 0:
+        # fallback: live page sometimes embeds partial card
+        live = await _cb_html(f"/live-cricket-scores/{mid}")
+        data2 = _cb_parse_scorecard(live, mid)
+        if data2["batting_count"] or data2["bowling_count"]:
+            data = data2
+    return ok(data, provider="cricbuzz", endpoint="scorecard",
+              how="batting[].r/b/sr · bowling[].w/eco · fall_of_wickets")
+
+@app.get("/cb/commentary", tags=["Cricbuzz"])
+async def cb_commentary(id: str = Query(..., description="Match id")):
+    """Ball-by-ball / key events commentary (HTML scrape)."""
+    mid = re.sub(r"\D", "", id) or id
+    html = await _cb_html(f"/cricket-full-commentary/{mid}")
+    data = _cb_parse_commentary(html, mid)
+    if data["count"] == 0:
+        # fallback live page text
+        live = await _cb_html(f"/live-cricket-scores/{mid}")
+        data = _cb_parse_commentary(live, mid)
+    return ok(data, provider="cricbuzz", endpoint="commentary")
+
+@app.get("/cb/table", tags=["Cricbuzz"])
+async def cb_table(
+    series_id: str = Query("", description="Optional series id e.g. 6614"),
+    path: str = Query("", description="Or full path after domain e.g. /cricket-series/6614/.../points-table"),
+):
+    """Points table / standings for a series."""
+    if path:
+        pth = path if path.startswith("/") else "/" + path
+    elif series_id:
+        sid = re.sub(r"\D", "", series_id)
+        pth = f"/cricket-series/{sid}/points-table"
+    else:
+        # default: current popular series links from series page
+        html = await _cb_html("/cricket-series")
+        soup = BeautifulSoup(html, "html.parser")
+        links = []
+        for a in soup.select('a[href*="/cricket-series/"]'):
+            href = a.get("href") or ""
+            if "points-table" in href or re.search(r"/cricket-series/\d+", href):
+                links.append({"title": a.get_text(" ", strip=True), "path": href,
+                              "url": CB_BASE + href if href.startswith("/") else href})
+        return ok({"items": links[:40], "count": len(links[:40]),
+                   "how": "Pass series_id or path=/cricket-series/ID/.../points-table"},
+                  provider="cricbuzz", endpoint="table_index")
+    html = await _cb_html(pth)
+    data = _cb_parse_points_table(html)
+    data["path"] = pth
+    data["url"] = CB_BASE + pth
+    return ok(data, provider="cricbuzz", endpoint="table")
+
+@app.get("/cb/rankings", tags=["Cricbuzz"])
+async def cb_rankings(
+    format: str = Query("test", description="test|odi|t20"),
+    category: str = Query("batsmen", description="batsmen|bowlers|allrounders|teams"),
+):
+    """ICC rankings pages scrape."""
+    fmt = (format or "test").lower().strip()
+    cat = (category or "batsmen").lower().strip()
+    # Cricbuzz ranking URL patterns
+    path = f"/cricket-stats/icc-rankings/{fmt}/{cat}"
+    alts = [
+        path,
+        f"/cricket-stats/icc-rankings/men/{fmt}-{cat}",
+        f"/cricket-stats/icc-rankings/men/{fmt}/{cat}",
+        "/cricket-stats/icc-rankings/men/batting",
+    ]
+    last_err = None
+    for pth in alts:
+        try:
+            html = await _cb_html(pth)
+            soup = BeautifulSoup(html, "html.parser")
+            title = soup.title.get_text(strip=True) if soup.title else pth
+            rows = []
+            for table in soup.select("table"):
+                for tr in table.select("tr"):
+                    cells = [c.get_text(" ", strip=True) for c in tr.select("th,td")]
+                    if any(cells):
+                        rows.append(cells)
+            if not rows:
+                # list items
+                for el in soup.select("a[href*='/profiles/'], a[href*='/cricket-team/']")[:50]:
+                    rows.append([el.get_text(" ", strip=True), el.get("href")])
+            if rows:
+                return ok({
+                    "title": title, "format": fmt, "category": cat,
+                    "path": pth, "rows": rows[:50], "count": len(rows[:50]),
+                    "url": CB_BASE + pth,
+                }, provider="cricbuzz", endpoint="rankings")
+        except Exception as e:
+            last_err = str(e)
+            continue
+    return ok({
+        "format": fmt, "category": cat, "rows": [], "count": 0,
+        "error": last_err or "rankings page empty or moved",
+        "hint": "Try format=odi category=batsmen or open cricbuzz rankings in browser for current path",
+    }, provider="cricbuzz", endpoint="rankings")
+
+@app.get("/cb/search", tags=["Cricbuzz"])
+async def cb_search(q: str = Query(..., min_length=1)):
+    """Search matches/players via Cricbuzz search page."""
+    html = await _cb_html(f"/search?q={quote(q)}")
+    soup = BeautifulSoup(html, "html.parser")
+    items = []
+    for a in soup.select("a[href]"):
+        href = a.get("href") or ""
+        text = a.get_text(" ", strip=True)
+        if not text or len(text) < 3:
+            continue
+        kind = None
+        if "/live-cricket-scores/" in href or "/cricket-scores/" in href:
+            kind = "match"
+        elif "/profiles/" in href:
+            kind = "player"
+        elif "/cricket-series/" in href:
+            kind = "series"
+        elif "/cricket-team/" in href:
+            kind = "team"
+        if kind:
+            mid = None
+            m = re.search(r"/live-cricket-scores/(\d+)", href)
+            if m:
+                mid = m.group(1)
+            items.append({
+                "kind": kind, "title": text[:160], "match_id": mid,
+                "url": CB_BASE + href if href.startswith("/") else href,
+            })
+    # dedupe
+    seen = set()
+    uniq = []
+    for it in items:
+        k = (it["kind"], it.get("url"))
+        if k in seen:
+            continue
+        seen.add(k)
+        uniq.append(it)
+    return ok({"query": q, "items": uniq[:40], "count": len(uniq[:40])},
+              provider="cricbuzz", endpoint="search")
+
+@app.get("/cb/series", tags=["Cricbuzz"])
+async def cb_series():
+    """List series links from Cricbuzz series index."""
+    html = await _cb_html("/cricket-series")
+    soup = BeautifulSoup(html, "html.parser")
+    items = []
+    seen = set()
+    for a in soup.select('a[href*="/cricket-series/"]'):
+        href = a.get("href") or ""
+        title = a.get_text(" ", strip=True)
+        if not title or href in seen:
+            continue
+        seen.add(href)
+        sid = None
+        m = re.search(r"/cricket-series/(\d+)", href)
+        if m:
+            sid = m.group(1)
+        items.append({
+            "series_id": sid, "title": title[:160],
+            "path": href,
+            "url": CB_BASE + href if href.startswith("/") else href,
+            "table_hint": f"/cb/table?series_id={sid}" if sid else None,
+        })
+    return ok({"items": items[:50], "count": len(items[:50])},
+              provider="cricbuzz", endpoint="series",
+              how="Use series_id with /cb/table?series_id=")
 
 
 # ========== DOCS UI (mobile-first) ==========
@@ -4312,7 +4677,7 @@ footer{text-align:center;color:var(--mu);font-size:12px;padding:20px 0 10px}
 </head>
 <body>
 <header class="top">
-  <div class="brand"><div class="logo">SH</div><div><h1>StreamHub API</h1><small>v8.4.1 · creator: shawon</small></div></div>
+  <div class="brand"><div class="logo">SH</div><div><h1>StreamHub API</h1><small>v8.4.2 · creator: shawon</small></div></div>
   <div class="search"><span style="opacity:.4;font-size:13px">⌕</span><input id="q" placeholder="Filter endpoints…" oninput="filt()"/></div>
 </header>
 <div class="tabs" id="tabs"></div>
@@ -4353,8 +4718,14 @@ const E = [
 {g:'OGPirate',p:'/og/search',how:'Search movies/TV.',params:[{n:'q',v:'avatar'}]},
 {g:'OGPirate',p:'/og/detail',how:'TMDB detail.',params:[{n:'id',v:'19995'},{n:'media',v:'movie'}]},
 {g:'OGPirate',p:'/og/stream',how:'Embed stream links for TMDB id.',params:[{n:'id',v:'19995'},{n:'media',v:'movie'}]},
-{g:'Cricbuzz',p:'/cb/live',how:'Live/recent cricket matches list.',params:[]},
-{g:'Cricbuzz',p:'/cb/score',how:'Match score scrape by id.',params:[{n:'id',v:'174057'}]},
+{g:'Cricbuzz',p:'/cb/live',how:'Live + recent matches (match_id list).',params:[]},
+{g:'Cricbuzz',p:'/cb/score',how:'Match summary status + score lines.',params:[{n:'id',v:'174057'}]},
+{g:'Cricbuzz',p:'/cb/scorecard',how:'Full batting / bowling / FOW tables.',params:[{n:'id',v:'174057'}]},
+{g:'Cricbuzz',p:'/cb/commentary',how:'Ball-by-ball / key events commentary.',params:[{n:'id',v:'174057'}]},
+{g:'Cricbuzz',p:'/cb/table',how:'Series points table. series_id or path.',params:[{n:'series_id',v:'6614'}]},
+{g:'Cricbuzz',p:'/cb/rankings',how:'ICC rankings scrape.',params:[{n:'format',v:'odi'},{n:'category',v:'batsmen'}]},
+{g:'Cricbuzz',p:'/cb/search',how:'Search matches / players / series.',params:[{n:'q',v:'india'}]},
+{g:'Cricbuzz',p:'/cb/series',how:'Series index list.',params:[]},
 {g:'Tools',p:'/tools/pixeldrain',how:'PixelDrain download URL from file id.',params:[{n:'id',v:'GauktM6T'}]},
 {g:'Tools',p:'/tools/mp4',how:'Extract MP4/MKV/M3U8 links from a page.',params:[{n:'url',v:'https://hubcloud.ist/drive/1qg90m0nr2599rq'}]},
 {g:'Tools',p:'/tools/cdn-types',how:'Known CDN host patterns.',params:[]},
