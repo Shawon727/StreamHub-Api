@@ -1,10 +1,9 @@
 """
-LibreTube / Piped / Invidious / SoundCloud / CCC helpers for StreamHub API.
-Extracted from com.github.libretube APK APIs.
+LibreTube / Piped / Invidious helpers for StreamHub API.
+Home feed, Shorts, Live, region select, CDN proxy streams.
 """
 from __future__ import annotations
 
-import asyncio
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -12,7 +11,6 @@ import httpx
 
 UA = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36 LibreTube"
 
-# Working-first order (tested 2026-10)
 INVIDIOUS_INSTANCES = [
     "https://invidious.flokinet.to",
     "https://inv.nadeko.net",
@@ -28,6 +26,32 @@ PIPED_INSTANCES = [
     "https://pipedapi.lunar.icu",
     "https://pipedapi.adminforge.de",
 ]
+
+# Common YouTube GL regions for UI select
+REGIONS = [
+    {"code": "US", "name": "United States"},
+    {"code": "IN", "name": "India"},
+    {"code": "BD", "name": "Bangladesh"},
+    {"code": "GB", "name": "United Kingdom"},
+    {"code": "PK", "name": "Pakistan"},
+    {"code": "SA", "name": "Saudi Arabia"},
+    {"code": "AE", "name": "UAE"},
+    {"code": "CA", "name": "Canada"},
+    {"code": "AU", "name": "Australia"},
+    {"code": "DE", "name": "Germany"},
+    {"code": "JP", "name": "Japan"},
+    {"code": "KR", "name": "South Korea"},
+    {"code": "BR", "name": "Brazil"},
+    {"code": "ID", "name": "Indonesia"},
+    {"code": "NG", "name": "Nigeria"},
+    {"code": "PH", "name": "Philippines"},
+    {"code": "TR", "name": "Turkey"},
+    {"code": "EG", "name": "Egypt"},
+    {"code": "FR", "name": "France"},
+    {"code": "MX", "name": "Mexico"},
+]
+
+TRENDING_TYPES = ["default", "music", "gaming", "movies"]
 
 SC_API = "https://api-v2.soundcloud.com"
 SC_CLIENT_FALLBACK = "iZIs9mchVcX5lhVRyQGGAYlNPVldzAoX"
@@ -47,10 +71,10 @@ def _client(timeout: float = 15.0) -> httpx.AsyncClient:
     )
 
 
-
 def inv_proxy_url(instance: str, video_id: str, itag) -> str:
     """Playable URL via Invidious companion (avoids googlevideo IP 403)."""
     return f"{instance.rstrip('/')}/companion/latest_version?id={video_id}&itag={itag}&local=true"
+
 
 def extract_video_id(raw: str) -> str:
     s = (raw or "").strip()
@@ -58,6 +82,13 @@ def extract_video_id(raw: str) -> str:
         return s
     m = re.search(r"(?:v=|/shorts/|youtu\.be/|embed/)([A-Za-z0-9_-]{6,20})", s)
     return m.group(1) if m else s
+
+
+def normalize_region(region: str) -> str:
+    r = (region or "US").strip().upper()
+    if len(r) != 2:
+        return "US"
+    return r
 
 
 async def _fetch_json(url: str, params: Optional[dict] = None, timeout: float = 14.0) -> Tuple[Optional[Any], Optional[str]]:
@@ -73,9 +104,35 @@ async def _fetch_json(url: str, params: Optional[dict] = None, timeout: float = 
         return None, str(e)[:120]
 
 
-# ---------- Invidious ----------
+def _card_from_inv(item: dict) -> dict:
+    """Normalize Invidious search/trending item to a card."""
+    vid = item.get("videoId") or item.get("id")
+    length = item.get("lengthSeconds")
+    thumb = None
+    thumbs = item.get("videoThumbnails") or []
+    if thumbs:
+        thumb = thumbs[0].get("url")
+    if not thumb or (isinstance(thumb, str) and thumb.startswith("/")):
+        thumb = f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg" if vid else None
+    return {
+        "videoId": vid,
+        "title": item.get("title"),
+        "author": item.get("author"),
+        "authorId": item.get("authorId"),
+        "thumbnail": thumb,
+        "duration": length,
+        "viewCount": item.get("viewCount"),
+        "publishedText": item.get("publishedText"),
+        "liveNow": bool(item.get("liveNow")),
+        "isShort": bool(length is not None and 0 < length <= 60 and not item.get("liveNow")),
+        "type": item.get("type") or "video",
+        "url": f"https://www.youtube.com/watch?v={vid}" if vid else None,
+        "shorts_url": f"https://www.youtube.com/shorts/{vid}" if vid else None,
+    }
+
+
+# ---------- Invidious video ----------
 async def inv_video(video_id: str) -> Tuple[Optional[dict], str, Optional[str]]:
-    """Return (data, instance, error). Prefer instances with formatStreams."""
     vid = extract_video_id(video_id)
     errors = []
     for base in INVIDIOUS_INSTANCES:
@@ -90,7 +147,7 @@ async def inv_video(video_id: str) -> Tuple[Optional[dict], str, Optional[str]]:
             errors.append(f"{base}: {data.get('error')}")
             continue
         n = len(data.get("formatStreams") or []) + len(data.get("adaptiveFormats") or [])
-        if n == 0 and not data.get("title"):
+        if n == 0 and not data.get("title") and not data.get("liveNow"):
             errors.append(f"{base}: empty")
             continue
         return data, base, None
@@ -105,9 +162,9 @@ def _height(q) -> int:
 
 
 def _pick_best_audio(audios: list) -> Optional[dict]:
-    """Prefer m4a/mp4 audio medium, then highest bitrate."""
     if not audios:
         return None
+
     def score(a):
         mime = (a.get("mimeType") or "").lower()
         br = int(a.get("bitrate") or 0)
@@ -120,18 +177,13 @@ def _pick_best_audio(audios: list) -> Optional[dict]:
         if "HIGH" in q:
             s += 30_000
         return s
+
     return max(audios, key=score)
 
 
 def _build_qualities(muxed: list, videos: list, audios: list) -> list:
-    """
-    Each entry is playable with audio:
-    - kind=muxed → single url (video+audio)
-    - kind=paired → video_url + audio_url (play together in ExoPlayer/VLC dual)
-    """
     best_audio = _pick_best_audio(audios)
-    by_h = {}
-    # muxed first
+    by_h: Dict[int, dict] = {}
     for m in muxed:
         h = _height(m.get("quality"))
         by_h[h or 360] = {
@@ -140,32 +192,24 @@ def _build_qualities(muxed: list, videos: list, audios: list) -> list:
             "kind": "muxed",
             "url": m.get("url"),
             "video_url": m.get("url"),
-            "audio_url": None,  # already in mux
+            "audio_url": None,
             "mimeType": m.get("mimeType"),
+            "itag": m.get("itag"),
             "has_audio": True,
             "play_mode": "single",
         }
-    # adaptive video-only paired with best audio
     for v in videos:
-        if not v.get("videoOnly") and v.get("url") in {x.get("url") for x in muxed}:
-            continue
-        if not v.get("videoOnly") and not v.get("mimeType", "").startswith("video"):
-            continue
-        # only pure video tracks for pairing
         mime = (v.get("mimeType") or "")
         if "audio" in mime and not mime.startswith("video"):
             continue
         h = _height(v.get("quality"))
         if not h:
             continue
-        # prefer avc/mp4 video when overwriting same height
         prev = by_h.get(h)
         if prev and prev.get("kind") == "muxed":
-            continue  # keep muxed for that height
-        if prev and prev.get("kind") == "paired":
-            # prefer mp4/avc
-            if "avc" not in mime and "mp4" not in mime:
-                continue
+            continue
+        if prev and prev.get("kind") == "paired" and "avc" not in mime and "mp4" not in mime:
+            continue
         if not best_audio:
             continue
         by_h[h] = {
@@ -178,15 +222,17 @@ def _build_qualities(muxed: list, videos: list, audios: list) -> list:
             "video_mime": mime,
             "audio_mime": best_audio.get("mimeType"),
             "audio_quality": best_audio.get("quality"),
+            "itag": v.get("itag"),
+            "audio_itag": best_audio.get("itag"),
             "has_audio": True,
-            "play_mode": "dual",  # client must play video+audio together
+            "play_mode": "dual",
         }
-    qualities = [by_h[k] for k in sorted(by_h.keys(), reverse=True)]
-    return qualities
+    return [by_h[k] for k in sorted(by_h.keys(), reverse=True)]
 
 
 def normalize_invidious(data: dict, instance: str, vid: str) -> dict:
     videos, audios, muxed = [], [], []
+    live_now = bool(data.get("liveNow"))
     for f in (data.get("formatStreams") or []):
         itag = f.get("itag")
         raw = f.get("url")
@@ -230,7 +276,6 @@ def normalize_invidious(data: dict, instance: str, vid: str) -> dict:
             videos.append(item)
 
     qualities = _build_qualities(muxed, videos, audios)
-    # ensure every quality uses proxy urls (already from items)
     direct = None
     default_quality = None
     for q in qualities:
@@ -250,7 +295,24 @@ def normalize_invidious(data: dict, instance: str, vid: str) -> dict:
         dash = instance.rstrip("/") + str(dash)
     if hls and str(hls).startswith("/"):
         hls = instance.rstrip("/") + str(hls)
-    # prefer companion dash if relative handled; also expose local latest list
+
+    # Live: prefer DASH/HLS; companion itag often 403 on live
+    if live_now:
+        if dash:
+            direct = dash
+        elif hls:
+            direct = hls
+        default_quality = {
+            "label": "live",
+            "kind": "live",
+            "url": direct,
+            "video_url": direct,
+            "audio_url": None,
+            "has_audio": True,
+            "play_mode": "single",
+            "note": "Live — use dash/hls in a player that supports MPEG-DASH/HLS",
+        }
+        qualities = [default_quality] + qualities
 
     return {
         "videoId": vid,
@@ -262,6 +324,8 @@ def normalize_invidious(data: dict, instance: str, vid: str) -> dict:
         "uploaderUrl": data.get("authorUrl"),
         "views": data.get("viewCount"),
         "likes": data.get("likeCount"),
+        "liveNow": live_now,
+        "isUpcoming": bool(data.get("isUpcoming")),
         "hls": hls,
         "dash": dash,
         "qualities": qualities,
@@ -274,15 +338,15 @@ def normalize_invidious(data: dict, instance: str, vid: str) -> dict:
         "instance": instance,
         "provider": "invidious",
         "recommended": (data.get("recommendedVideos") or [])[:12],
+        "embed_url": f"https://www.youtube.com/embed/{vid}?autoplay=1",
         "how_to_play": (
-            "ALL urls are Invidious companion proxy (no googlevideo 403). "
-            "qualities[].kind=muxed → play url alone (video+audio). "
-            "kind=paired → play video_url + audio_url TOGETHER. "
-            "dash/hls → single adaptive URL with audio."
+            "VOD: qualities muxed=single url; paired=video_url+audio_url together. "
+            "LIVE: use dash or hls (or embed_url). Companion itag proxy may 403 on live."
         ),
     }
 
 
+# ---------- Piped ----------
 async def piped_get(path: str, params: Optional[dict] = None) -> Tuple[Optional[Any], str, Optional[str]]:
     errors = []
     for base in PIPED_INSTANCES:
@@ -296,8 +360,7 @@ async def piped_get(path: str, params: Optional[dict] = None) -> Tuple[Optional[
             if "SignInConfirmNotBot" in err_s or "LOGIN_REQUIRED" in err_s:
                 errors.append(f"{base}: bot-check")
                 continue
-            # still return if has streams
-            if not (data.get("videoStreams") or data.get("audioStreams") or data.get("title")):
+            if not (data.get("videoStreams") or data.get("audioStreams") or data.get("title") or data.get("items")):
                 errors.append(f"{base}: {err_s[:80]}")
                 continue
         return data, base, None
@@ -358,6 +421,7 @@ def normalize_piped(data: dict, instance: str, vid: str) -> dict:
         "uploaderUrl": data.get("uploaderUrl"),
         "views": data.get("views"),
         "likes": data.get("likes"),
+        "liveNow": bool(data.get("livestream")),
         "hls": data.get("hls"),
         "dash": data.get("dash"),
         "qualities": qualities,
@@ -372,30 +436,30 @@ def normalize_piped(data: dict, instance: str, vid: str) -> dict:
         "instance": instance,
         "provider": "piped",
         "error": data.get("error"),
-        "how_to_play": (
-            "qualities[].kind=muxed → single url. "
-            "kind=paired → video_url + audio_url together."
-        ),
+        "embed_url": f"https://www.youtube.com/embed/{vid}?autoplay=1",
+        "how_to_play": "qualities muxed=single; paired=video+audio dual play.",
     }
 
 
 async def get_streams(video_id: str) -> dict:
-    """Invidious first (real googlevideo CDN), then Piped."""
+    """Invidious first (proxy CDN), then Piped. Live uses dash/hls."""
     vid = extract_video_id(video_id)
-
-    # 1) Invidious (best CDN)
     inv_data, inv_inst, inv_err = await inv_video(vid)
-    if inv_data and (inv_data.get("formatStreams") or inv_data.get("adaptiveFormats")):
+    if inv_data and (
+        inv_data.get("formatStreams")
+        or inv_data.get("adaptiveFormats")
+        or inv_data.get("liveNow")
+        or inv_data.get("dashUrl")
+    ):
         return normalize_invidious(inv_data, inv_inst, vid)
 
-    # 2) Piped fallback
     piped_data, piped_inst, piped_err = await piped_get(f"/streams/{vid}")
     if piped_data and isinstance(piped_data, dict):
         out = normalize_piped(piped_data, piped_inst, vid)
-        if out.get("cdn_count"):
+        if out.get("cdn_count") or out.get("hls") or out.get("dash"):
             return out
         if out.get("title"):
-            out["note"] = "Metadata only — streams blocked by YouTube bot-check on instance IP"
+            out["note"] = "Metadata only — streams blocked"
             out["errors"] = [x for x in (inv_err, piped_err) if x]
             return out
 
@@ -405,12 +469,13 @@ async def get_streams(video_id: str) -> dict:
         "videoStreams": [],
         "audioStreams": [],
         "muxedStreams": [],
+        "qualities": [],
         "direct_play": None,
         "cdn_count": 0,
         "thumbnail": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg",
         "errors": [x for x in (inv_err, piped_err) if x],
-        "note": "All extractors failed (YouTube bot-check or instance down). Retry later.",
-        "embed_url": f"https://www.youtube.com/embed/{vid}?autoplay=1&rel=0",
+        "note": "All extractors failed. Retry later or use embed_url.",
+        "embed_url": f"https://www.youtube.com/embed/{vid}?autoplay=1",
     }
 
 
@@ -419,6 +484,166 @@ async def piped_path(path: str, params: Optional[dict] = None) -> Tuple[Any, str
     if data is None:
         raise RuntimeError(err or "piped failed")
     return data, inst
+
+
+# ---------- Home / Trending / Shorts / Live ----------
+async def inv_trending(region: str = "US", type_: str = "default") -> Tuple[List[dict], str, Optional[str]]:
+    region = normalize_region(region)
+    type_ = (type_ or "default").lower()
+    if type_ not in TRENDING_TYPES:
+        type_ = "default"
+    errors = []
+    for base in INVIDIOUS_INSTANCES:
+        data, err = await _fetch_json(f"{base}/api/v1/trending", {"region": region, "type": type_})
+        if err:
+            errors.append(f"{base}: {err}")
+            continue
+        if isinstance(data, list) and data:
+            return [_card_from_inv(x) for x in data if x.get("videoId") or x.get("type") == "video"], base, None
+    return [], "", "; ".join(errors[:3])
+
+
+async def inv_popular(region: str = "US") -> Tuple[List[dict], str, Optional[str]]:
+    """Popular feed (region hint only — some instances ignore region)."""
+    errors = []
+    for base in INVIDIOUS_INSTANCES:
+        data, err = await _fetch_json(f"{base}/api/v1/popular")
+        if err:
+            errors.append(f"{base}: {err}")
+            continue
+        if isinstance(data, list) and data:
+            return [_card_from_inv(x) for x in data if x.get("videoId")], base, None
+    return [], "", "; ".join(errors[:3])
+
+
+async def inv_search(
+    q: str,
+    region: str = "US",
+    type_: str = "video",
+    page: int = 1,
+) -> Tuple[List[dict], str, Optional[str]]:
+    region = normalize_region(region)
+    params = {"q": q, "region": region, "type": type_, "page": page}
+    errors = []
+    for base in INVIDIOUS_INSTANCES:
+        data, err = await _fetch_json(f"{base}/api/v1/search", params)
+        if err:
+            errors.append(f"{base}: {err}")
+            continue
+        if isinstance(data, list):
+            return [_card_from_inv(x) for x in data], base, None
+    return [], "", "; ".join(errors[:3])
+
+
+async def get_home(region: str = "US") -> dict:
+    """YouTube-like home: popular + trending sections."""
+    region = normalize_region(region)
+    popular, p_inst, p_err = await inv_popular(region)
+    trending, t_inst, t_err = await inv_trending(region, "default")
+    music, m_inst, _ = await inv_trending(region, "music")
+    gaming, g_inst, _ = await inv_trending(region, "gaming")
+    movies, mo_inst, _ = await inv_trending(region, "movies")
+    return {
+        "region": region,
+        "sections": [
+            {"id": "popular", "title": "Popular", "items": popular[:20]},
+            {"id": "trending", "title": "Trending", "items": trending[:20]},
+            {"id": "music", "title": "Music", "items": music[:12]},
+            {"id": "gaming", "title": "Gaming", "items": gaming[:12]},
+            {"id": "movies", "title": "Movies", "items": movies[:12]},
+        ],
+        "instances": {"popular": p_inst, "trending": t_inst, "music": m_inst},
+        "errors": [x for x in (p_err, t_err) if x],
+        "how": "Pick videoId → /lt/streams?id= or /lt/play?id=&quality=best. Change region=IN|BD|US|...",
+    }
+
+
+async def get_shorts(region: str = "US", q: str = "shorts", page: int = 1) -> dict:
+    """
+    Shorts feed: pull trending/popular + targeted searches, keep duration <= 60s.
+    (YouTube has no public shorts shelf on Invidious — we filter by length.)
+    """
+    region = normalize_region(region)
+    q = (q or "shorts").strip()
+    seen = set()
+    items = []
+    inst = ""
+
+    async def _add(cards, require_short_dur=True):
+        nonlocal items, seen
+        for c in cards:
+            vid = c.get("videoId")
+            if not vid or vid in seen:
+                continue
+            if c.get("liveNow"):
+                continue
+            dur = c.get("duration")
+            if require_short_dur:
+                if not isinstance(dur, int) or dur <= 0 or dur > 60:
+                    continue
+            else:
+                if isinstance(dur, int) and dur > 60:
+                    continue
+            c["isShort"] = True
+            if not c.get("thumbnail") or str(c.get("thumbnail", "")).startswith("/"):
+                c["thumbnail"] = f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
+            seen.add(vid)
+            items.append(c)
+
+    # 1) Trending / popular short clips
+    for type_ in ("default", "music", "gaming"):
+        cards, inst, _ = await inv_trending(region, type_)
+        await _add(cards, require_short_dur=True)
+    pop, inst, _ = await inv_popular(region)
+    await _add(pop, require_short_dur=True)
+
+    # 2) Search phrases that often return real short videos
+    searches = [q, f"{q} short video", "funny short", "viral short video", "wait for it", "oddly satisfying"]
+    for query in searches:
+        cards, inst, _ = await inv_search(query, region=region, type_="video", page=page)
+        await _add(cards, require_short_dur=True)
+        if len(items) >= 30:
+            break
+
+    return {
+        "region": region,
+        "query": q,
+        "items": items[:40],
+        "count": len(items[:40]),
+        "instance": inst,
+        "how": "Play with /lt/streams?id=VIDEO_ID (companion proxy)",
+    }
+
+
+async def get_live(region: str = "US", q: str = "live") -> dict:
+    """Live streams list. Playback: dash/hls or embed (itag proxy often fails on live)."""
+    region = normalize_region(region)
+    cards, inst, err = await inv_search(q or "live", region=region, type_="video")
+    # also news live
+    cards2, _, _ = await inv_search("live news", region=region, type_="video")
+    seen = set()
+    items = []
+    for c in cards + cards2:
+        vid = c.get("videoId")
+        if not vid or vid in seen:
+            continue
+        if c.get("liveNow") or c.get("duration") == 0:
+            c["liveNow"] = True
+            c["play_hint"] = f"/lt/streams?id={vid} → use dash or embed_url"
+            seen.add(vid)
+            items.append(c)
+    return {
+        "region": region,
+        "query": q,
+        "items": items[:40],
+        "count": len(items[:40]),
+        "instance": inst,
+        "error": err,
+        "how": (
+            "Live playback: GET /lt/streams?id=ID → prefer dash/hls single URL, "
+            "or embed_url. Companion itag proxy often returns 403 for live."
+        ),
+    }
 
 
 # ---------- SoundCloud ----------
