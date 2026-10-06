@@ -1,4 +1,4 @@
-# StreamHub API v8.4.5 — creator: shawon
+# StreamHub API v8.4.7 — creator: shawon
 from __future__ import annotations
 
 import asyncio, base64, gzip, hashlib, hmac, json, random, re, time, uuid
@@ -17,7 +17,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response, StreamingResponse, PlainTextResponse
 
-CREATOR, VERSION = "shawon", "8.4.5"
+CREATOR, VERSION = "shawon", "8.4.7"
 app = FastAPI(title="StreamHub API", version=VERSION, docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -4640,18 +4640,81 @@ def _lt_require():
         raise HTTPException(500, detail=fail("libretube_api module missing — upload libretube_api.py next to api.py"))
     return LT
 
-@app.get("/lt/trending", tags=["LibreTube"])
-async def lt_trending(region: str = Query("US")):
-    """Piped trending (LibreTube home feed)."""
+@app.get("/lt/regions", tags=["LibreTube"])
+async def lt_regions():
+    """Region codes for home/trending/shorts/live (select in app UI)."""
     mod = _lt_require()
-    try:
-        data, inst = await mod.piped_path("/trending", {"region": region})
-    except Exception as e:
-        return ok({"items": [], "count": 0, "error": str(e)[:200]}, provider="libretube", endpoint="trending")
-    items = data if isinstance(data, list) else (data.get("items") or [])
-    return ok({"items": items, "count": len(items), "region": region, "instance": inst},
+    return ok({
+        "regions": mod.REGIONS,
+        "trending_types": mod.TRENDING_TYPES,
+        "default": "US",
+        "how": "Pass region=BD|IN|US|GB|... on /lt/home /lt/trending /lt/shorts /lt/live",
+    }, provider="libretube", endpoint="regions")
+
+@app.get("/lt/home", tags=["LibreTube"])
+async def lt_home(region: str = Query("US", description="Region code e.g. US IN BD GB")):
+    """YouTube-like home page: Popular + Trending + Music + Gaming + Movies."""
+    mod = _lt_require()
+    data = await mod.get_home(region)
+    return ok(data, provider="libretube", endpoint="home",
+              how="sections[].items[].videoId → /lt/streams?id=")
+
+@app.get("/lt/trending", tags=["LibreTube"])
+async def lt_trending(
+    region: str = Query("US", description="US|IN|BD|GB|..."),
+    type: str = Query("default", description="default|music|gaming|movies"),
+):
+    """Trending by region + type (YouTube trending tabs)."""
+    mod = _lt_require()
+    items, inst, err = await mod.inv_trending(region, type)
+    if not items:
+        # Piped fallback
+        try:
+            data, inst = await mod.piped_path("/trending", {"region": region})
+            raw = data if isinstance(data, list) else (data.get("items") or [])
+            items = []
+            for x in raw:
+                vid = None
+                url = x.get("url") or ""
+                if "v=" in url:
+                    vid = url.split("v=")[-1][:11]
+                elif x.get("url", "").startswith("/watch"):
+                    import re as _re
+                    m = _re.search(r"v=([A-Za-z0-9_-]{6,20})", url)
+                    vid = m.group(1) if m else None
+                items.append({
+                    "videoId": vid, "title": x.get("title"), "author": x.get("uploaderName"),
+                    "thumbnail": x.get("thumbnail"), "duration": x.get("duration"),
+                    "viewCount": x.get("views"), "liveNow": False,
+                })
+        except Exception as e:
+            return ok({"items": [], "count": 0, "error": err or str(e)[:200], "region": region},
+                      provider="libretube", endpoint="trending")
+    return ok({"items": items, "count": len(items), "region": region, "type": type, "instance": inst},
               provider="libretube", endpoint="trending",
-              how="Then /lt/streams?id=VIDEO_ID for googlevideo CDN")
+              how="/lt/streams?id=VIDEO_ID")
+
+@app.get("/lt/shorts", tags=["LibreTube"])
+async def lt_shorts(
+    region: str = Query("US"),
+    q: str = Query("shorts", description="Search query for shorts"),
+    page: int = Query(1, ge=1, le=10),
+):
+    """YouTube Shorts feed (duration ≤ 60s) with region."""
+    mod = _lt_require()
+    data = await mod.get_shorts(region=region, q=q, page=page)
+    return ok(data, provider="libretube", endpoint="shorts")
+
+@app.get("/lt/live", tags=["LibreTube"])
+async def lt_live(
+    region: str = Query("US"),
+    q: str = Query("live", description="Search query for live streams"),
+):
+    """Live streams list by region. Play via /lt/streams → dash/hls or embed_url."""
+    mod = _lt_require()
+    data = await mod.get_live(region=region, q=q)
+    return ok(data, provider="libretube", endpoint="live")
+
 
 @app.get("/lt/search", tags=["LibreTube"])
 async def lt_search(
@@ -4972,7 +5035,7 @@ footer{text-align:center;color:var(--mu);font-size:12px;padding:20px 0 10px}
 </head>
 <body>
 <header class="top">
-  <div class="brand"><div class="logo">SH</div><div><h1>StreamHub API</h1><small>v8.4.5 · creator: shawon</small></div></div>
+  <div class="brand"><div class="logo">SH</div><div><h1>StreamHub API</h1><small>v8.4.7 · creator: shawon</small></div></div>
   <div class="search"><span style="opacity:.4;font-size:13px">⌕</span><input id="q" placeholder="Filter endpoints…" oninput="filt()"/></div>
 </header>
 <div class="tabs" id="tabs"></div>
@@ -5021,7 +5084,11 @@ const E = [
 {g:'Cricbuzz',p:'/cb/rankings',how:'ICC rankings scrape.',params:[{n:'format',v:'odi'},{n:'category',v:'batsmen'}]},
 {g:'Cricbuzz',p:'/cb/search',how:'Search matches / players / series.',params:[{n:'q',v:'india'}]},
 {g:'Cricbuzz',p:'/cb/series',how:'Series index list.',params:[]},
-{g:'LibreTube',p:'/lt/trending',how:'YouTube trending via Piped.',params:[{n:'region',v:'US'}]},
+{g:'LibreTube',p:'/lt/regions',how:'Region list for UI select.',params:[]},
+{g:'LibreTube',p:'/lt/home',how:'Full YouTube-like home (popular+trending+music+gaming+movies).',params:[{n:'region',v:'IN'}]},
+{g:'LibreTube',p:'/lt/trending',how:'Trending by region+type default|music|gaming|movies.',params:[{n:'region',v:'BD'},{n:'type',v:'music'}]},
+{g:'LibreTube',p:'/lt/shorts',how:'Shorts feed duration<=60s.',params:[{n:'region',v:'US'},{n:'q',v:'shorts'}]},
+{g:'LibreTube',p:'/lt/live',how:'Live streams list. Play with dash/hls from /lt/streams.',params:[{n:'region',v:'US'},{n:'q',v:'live'}]},
 {g:'LibreTube',p:'/lt/search',how:'Search videos/channels/playlists.',params:[{n:'q',v:'despacito'}]},
 {g:'LibreTube',p:'/lt/suggestions',how:'Search autocomplete.',params:[{n:'query',v:'despa'}]},
 {g:'LibreTube',p:'/lt/streams',how:'CDN streams + qualities[] (muxed/paired with audio).',params:[{n:'id',v:'kJQP7kiw5Fk'}]},
