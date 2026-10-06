@@ -47,6 +47,11 @@ def _client(timeout: float = 15.0) -> httpx.AsyncClient:
     )
 
 
+
+def inv_proxy_url(instance: str, video_id: str, itag) -> str:
+    """Playable URL via Invidious companion (avoids googlevideo IP 403)."""
+    return f"{instance.rstrip('/')}/companion/latest_version?id={video_id}&itag={itag}&local=true"
+
 def extract_video_id(raw: str) -> str:
     s = (raw or "").strip()
     if re.fullmatch(r"[A-Za-z0-9_-]{6,20}", s):
@@ -183,27 +188,35 @@ def _build_qualities(muxed: list, videos: list, audios: list) -> list:
 def normalize_invidious(data: dict, instance: str, vid: str) -> dict:
     videos, audios, muxed = [], [], []
     for f in (data.get("formatStreams") or []):
-        u = f.get("url")
-        if not u:
+        itag = f.get("itag")
+        raw = f.get("url")
+        if not itag and not raw:
             continue
+        play = inv_proxy_url(instance, vid, itag) if itag else raw
         item = {
-            "url": u,
+            "url": play,
+            "raw_url": raw,
+            "itag": itag,
             "quality": f.get("qualityLabel") or f.get("quality"),
             "mimeType": f.get("type"),
             "bitrate": f.get("bitrate"),
             "container": f.get("container"),
             "videoOnly": False,
-            "source": "invidious-formatStreams",
+            "source": "invidious-muxed",
         }
         muxed.append(item)
         videos.append(item)
     for f in (data.get("adaptiveFormats") or []):
-        u = f.get("url")
-        if not u:
+        itag = f.get("itag")
+        raw = f.get("url")
+        if not itag and not raw:
             continue
         t = (f.get("type") or "")
+        play = inv_proxy_url(instance, vid, itag) if itag else raw
         item = {
-            "url": u,
+            "url": play,
+            "raw_url": raw,
+            "itag": itag,
             "quality": f.get("qualityLabel") or f.get("quality") or f.get("audioQuality"),
             "mimeType": t,
             "bitrate": f.get("bitrate"),
@@ -217,7 +230,7 @@ def normalize_invidious(data: dict, instance: str, vid: str) -> dict:
             videos.append(item)
 
     qualities = _build_qualities(muxed, videos, audios)
-    # default play: highest muxed, else highest paired
+    # ensure every quality uses proxy urls (already from items)
     direct = None
     default_quality = None
     for q in qualities:
@@ -233,11 +246,11 @@ def normalize_invidious(data: dict, instance: str, vid: str) -> dict:
     thumb = thumbs[0].get("url") if thumbs else None
     hls = data.get("hlsUrl") or data.get("hls")
     dash = data.get("dashUrl") or data.get("dash")
-    # make relative dash/hls absolute on instance
     if dash and str(dash).startswith("/"):
         dash = instance.rstrip("/") + str(dash)
     if hls and str(hls).startswith("/"):
         hls = instance.rstrip("/") + str(hls)
+    # prefer companion dash if relative handled; also expose local latest list
 
     return {
         "videoId": vid,
@@ -262,14 +275,14 @@ def normalize_invidious(data: dict, instance: str, vid: str) -> dict:
         "provider": "invidious",
         "recommended": (data.get("recommendedVideos") or [])[:12],
         "how_to_play": (
+            "ALL urls are Invidious companion proxy (no googlevideo 403). "
             "qualities[].kind=muxed → play url alone (video+audio). "
-            "kind=paired → play video_url AND audio_url together (ExoPlayer MultipleMediaSource / VLC input-slave). "
-            "Or use hls/dash single URL for adaptive quality + audio."
+            "kind=paired → play video_url + audio_url TOGETHER. "
+            "dash/hls → single adaptive URL with audio."
         ),
     }
 
 
-# ---------- Piped ----------
 async def piped_get(path: str, params: Optional[dict] = None) -> Tuple[Optional[Any], str, Optional[str]]:
     errors = []
     for base in PIPED_INSTANCES:
