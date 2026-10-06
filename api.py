@@ -1,4 +1,4 @@
-# StreamHub API v8.4.3 — creator: shawon
+# StreamHub API v8.4.5 — creator: shawon
 from __future__ import annotations
 
 import asyncio, base64, gzip, hashlib, hmac, json, random, re, time, uuid
@@ -7,11 +7,17 @@ from urllib.parse import parse_qsl, urljoin, urlparse, quote
 
 import httpx
 from bs4 import BeautifulSoup
+
+try:
+    import libretube_api as LT
+except ImportError:
+    LT = None  # type: ignore
+
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response, StreamingResponse, PlainTextResponse
 
-CREATOR, VERSION = "shawon", "8.4.3"
+CREATOR, VERSION = "shawon", "8.4.5"
 app = FastAPI(title="StreamHub API", version=VERSION, docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -4626,386 +4632,292 @@ async def cb_series():
               how="Use series_id with /cb/table?series_id=")
 
 
-# ========== LIBRETUBE / PIPED (from app-release APK com.github.libretube) ==========
-# APK sources: Piped API, SoundCloud api-v2, Bandcamp mobile API, media.ccc.de, SponsorBlock
-PIPED_INSTANCES = [
-    "https://pipedapi.ducks.party",
-    "https://api.piped.private.coffee",
-    "https://pipedapi.kavin.rocks",
-    "https://pipedapi.adminforge.de",
-    "https://pipedapi.syncpundit.io",
-]
-SC_API = "https://api-v2.soundcloud.com"
-SC_CLIENT_IDS = [
-    "iZIs9mchVcX5lhVRyQGGAYlNPVldzAoX",  # public fallback (may rotate)
-]
-CCC_API = "https://api.media.ccc.de"
-SPONSOR_API = "https://sponsor.ajay.app/api"
-DEARROW_THUMB = "https://dearrow-thumb.ajay.app/api/v1/getThumbnail"
+# ========== LIBRETUBE / PIPED / INVIDIOUS (see libretube_api.py) ==========
+# APK: com.github.libretube — Piped + Invidious CDN + SoundCloud + CCC + Bandcamp
 
-_lt_sc_client_id: Optional[str] = None
-
-async def _piped_get(path: str, params: Optional[dict] = None) -> Tuple[dict, str]:
-    """Try Piped instances until one returns usable JSON."""
-    last_err = "no instances"
-    for base in PIPED_INSTANCES:
-        url = base.rstrip("/") + (path if path.startswith("/") else "/" + path)
-        try:
-            async with _client(18.0) as client:
-                r = await client.get(url, params=params or {}, headers={
-                    "User-Agent": UA,
-                    "Accept": "application/json",
-                })
-                if r.status_code >= 500:
-                    last_err = f"{base} HTTP {r.status_code}"
-                    continue
-                ct = r.headers.get("content-type", "")
-                if "json" not in ct and not (r.text[:1] in "{["):
-                    last_err = f"{base} non-json"
-                    continue
-                data = r.json()
-                if isinstance(data, dict) and data.get("error") and "SignInConfirmNotBot" in str(data.get("error")):
-                    last_err = "YouTube bot-check on instance IP"
-                    continue
-                return data, base
-        except Exception as e:
-            last_err = f"{base}: {e}"
-            continue
-    raise HTTPException(502, detail=fail("All Piped instances failed", error=last_err, provider="libretube"))
-
-def _lt_normalize_streams(data: dict, instance: str) -> dict:
-    """Flatten Piped streams response to CDN-friendly list."""
-    videos, audios = [], []
-    for v in (data.get("videoStreams") or []):
-        u = v.get("url")
-        if not u:
-            continue
-        videos.append({
-            "url": u,
-            "quality": v.get("quality"),
-            "mimeType": v.get("mimeType"),
-            "codec": v.get("codec"),
-            "bitrate": v.get("bitrate"),
-            "videoOnly": v.get("videoOnly"),
-            "format": v.get("format"),
-            "itag": v.get("itag"),
-        })
-    for a in (data.get("audioStreams") or []):
-        u = a.get("url")
-        if not u:
-            continue
-        audios.append({
-            "url": u,
-            "quality": a.get("quality"),
-            "mimeType": a.get("mimeType"),
-            "codec": a.get("codec"),
-            "bitrate": a.get("bitrate"),
-            "format": a.get("format"),
-        })
-    # prefer muxed non-videoOnly for easy play
-    direct = [x for x in videos if not x.get("videoOnly")] + [x for x in videos if x.get("videoOnly")]
-    return {
-        "title": data.get("title"),
-        "description": (data.get("description") or "")[:500],
-        "thumbnail": data.get("thumbnailUrl"),
-        "duration": data.get("duration"),
-        "uploader": data.get("uploader"),
-        "uploaderUrl": data.get("uploaderUrl"),
-        "uploaderAvatar": data.get("uploaderAvatar"),
-        "views": data.get("views"),
-        "likes": data.get("likes"),
-        "uploadDate": data.get("uploadDate"),
-        "hls": data.get("hls"),
-        "dash": data.get("dash"),
-        "videoStreams": videos,
-        "audioStreams": audios,
-        "direct_play": (direct[0]["url"] if direct else (audios[0]["url"] if audios else data.get("hls") or data.get("dash"))),
-        "cdn_count": len(videos) + len(audios),
-        "related": (data.get("relatedStreams") or [])[:12],
-        "subtitles": data.get("subtitles") or [],
-        "instance": instance,
-        "error": data.get("error"),
-    }
+def _lt_require():
+    if LT is None:
+        raise HTTPException(500, detail=fail("libretube_api module missing — upload libretube_api.py next to api.py"))
+    return LT
 
 @app.get("/lt/trending", tags=["LibreTube"])
-async def lt_trending(region: str = Query("US", description="ISO country e.g. US, IN, BD")):
-    """Piped trending videos (LibreTube home)."""
-    data, inst = await _piped_get("/trending", {"region": region})
-    items = data if isinstance(data, list) else (data.get("items") or data.get("relatedStreams") or [])
+async def lt_trending(region: str = Query("US")):
+    """Piped trending (LibreTube home feed)."""
+    mod = _lt_require()
+    try:
+        data, inst = await mod.piped_path("/trending", {"region": region})
+    except Exception as e:
+        return ok({"items": [], "count": 0, "error": str(e)[:200]}, provider="libretube", endpoint="trending")
+    items = data if isinstance(data, list) else (data.get("items") or [])
     return ok({"items": items, "count": len(items), "region": region, "instance": inst},
               provider="libretube", endpoint="trending",
-              how="Open /lt/streams?id=VIDEO_ID for CDN streams")
+              how="Then /lt/streams?id=VIDEO_ID for googlevideo CDN")
 
 @app.get("/lt/search", tags=["LibreTube"])
 async def lt_search(
     q: str = Query(..., min_length=1),
-    filter: str = Query("all", description="all|videos|channels|playlists|music_songs|music_videos"),
+    filter: str = Query("all", description="all|videos|channels|playlists"),
 ):
-    """Piped search — same as LibreTube search."""
-    data, inst = await _piped_get("/search", {"q": q, "filter": filter})
+    mod = _lt_require()
+    try:
+        data, inst = await mod.piped_path("/search", {"q": q, "filter": filter})
+    except Exception as e:
+        return ok({"items": [], "count": 0, "error": str(e)[:200]}, provider="libretube", endpoint="search")
     items = data.get("items") if isinstance(data, dict) else data
     return ok({
-        "query": q, "filter": filter,
-        "items": items or [],
+        "query": q, "filter": filter, "items": items or [],
         "nextpage": data.get("nextpage") if isinstance(data, dict) else None,
-        "suggestion": data.get("suggestion") if isinstance(data, dict) else None,
-        "count": len(items or []),
-        "instance": inst,
+        "count": len(items or []), "instance": inst,
     }, provider="libretube", endpoint="search")
 
 @app.get("/lt/suggestions", tags=["LibreTube"])
 async def lt_suggestions(query: str = Query(..., min_length=1)):
-    data, inst = await _piped_get("/suggestions", {"query": query})
+    mod = _lt_require()
+    try:
+        data, inst = await mod.piped_path("/suggestions", {"query": query})
+    except Exception as e:
+        return ok({"suggestions": [], "error": str(e)[:200]}, provider="libretube", endpoint="suggestions")
     return ok({"query": query, "suggestions": data if isinstance(data, list) else [], "instance": inst},
               provider="libretube", endpoint="suggestions")
 
 @app.get("/lt/streams", tags=["LibreTube"])
-async def lt_streams(id: str = Query(..., description="YouTube video id e.g. kJQP7kiw5Fk")):
+async def lt_streams(id: str = Query(..., description="YouTube video id or URL")):
     """
-    Direct CDN streams (video + audio) via Piped — LibreTube player source.
-    Returns videoStreams[].url / audioStreams[].url / direct_play when instance not bot-blocked.
+    Direct CDN streams — Invidious (googlevideo) first, then Piped.
+    Returns videoStreams / audioStreams / muxedStreams / direct_play.
     """
-    vid = id.strip()
-    if "youtube.com" in vid or "youtu.be" in vid:
-        m = re.search(r"(?:v=|/shorts/|youtu\.be/)([A-Za-z0-9_-]{6,20})", vid)
-        if m:
-            vid = m.group(1)
-    data, inst = await _piped_get(f"/streams/{vid}")
-    out = _lt_normalize_streams(data if isinstance(data, dict) else {}, inst)
-    out["videoId"] = vid
-    if out.get("error") and not out.get("cdn_count"):
-        return ok(out, provider="libretube", endpoint="streams",
-                  how="Instance IP bot-blocked by YouTube. Try later, another region instance, or use /lt/trending + search.")
+    mod = _lt_require()
+    out = await mod.get_streams(id)
+    ok_flag = bool(out.get("cdn_count") or out.get("direct_play") or out.get("title"))
     return ok(out, provider="libretube", endpoint="streams",
-              how="Use direct_play or videoStreams[].url in VLC. Prefer non-videoOnly for single-file play.")
+              how="Prefer muxedStreams or direct_play for VLC. adaptive audio/video may need merge.")
+
+
+@app.get("/lt/play", tags=["LibreTube"])
+async def lt_play(
+    id: str = Query(..., description="YouTube video id"),
+    quality: str = Query("best", description="best|worst|360|720|1080|144|240|480"),
+):
+    """
+    Pick one quality with audio guaranteed.
+    - muxed: returns url (video+audio in one file)
+    - paired: returns video_url + audio_url (play both together)
+    """
+    mod = _lt_require()
+    out = await mod.get_streams(id)
+    qualities = out.get("qualities") or []
+    if not qualities:
+        return ok(out, provider="libretube", endpoint="play",
+                  how="No streams — try /lt/streams or later")
+    qwant = (quality or "best").lower().strip()
+    if qwant in ("best", "highest", "max"):
+        chosen = qualities[0]
+    elif qwant in ("worst", "lowest", "min"):
+        chosen = qualities[-1]
+    else:
+        h = mod._height(qwant)
+        exact = [q for q in qualities if q.get("height") == h]
+        if exact:
+            chosen = exact[0]
+        else:
+            chosen = min(qualities, key=lambda q: abs((q.get("height") or 0) - h))
+    return ok({
+        "videoId": out.get("videoId"),
+        "title": out.get("title"),
+        "thumbnail": out.get("thumbnail"),
+        "duration": out.get("duration"),
+        "selected": chosen,
+        "play_mode": chosen.get("play_mode"),
+        "url": chosen.get("url"),
+        "video_url": chosen.get("video_url"),
+        "audio_url": chosen.get("audio_url"),
+        "has_audio": chosen.get("has_audio"),
+        "hls": out.get("hls"),
+        "dash": out.get("dash"),
+        "all_qualities": [{"label": q.get("label"), "kind": q.get("kind"), "height": q.get("height")} for q in qualities],
+        "how": (
+            "play_mode=single → open url (audio included). "
+            "play_mode=dual → MUST play video_url + audio_url together. "
+            "Or use dash/hls for adaptive quality with audio in one URL."
+        ),
+    }, provider="libretube", endpoint="play")
+
 
 @app.get("/lt/comments", tags=["LibreTube"])
 async def lt_comments(id: str = Query(...), nextpage: str = Query("")):
+    mod = _lt_require()
+    vid = mod.extract_video_id(id)
+    path = f"/comments/{vid}"
     params = {}
-    path = f"/comments/{id.strip()}"
     if nextpage:
-        path = f"/nextpage/comments/{id.strip()}"
+        path = f"/nextpage/comments/{vid}"
         params["nextpage"] = nextpage
-    data, inst = await _piped_get(path, params)
+    try:
+        data, inst = await mod.piped_path(path, params)
+    except Exception as e:
+        return ok({"comments": [], "error": str(e)[:200]}, provider="libretube", endpoint="comments")
     return ok(data if isinstance(data, dict) else {"comments": data}, provider="libretube", endpoint="comments", instance=inst)
 
 @app.get("/lt/channel", tags=["LibreTube"])
-async def lt_channel(id: str = Query(..., description="UC... channel id or name")):
+async def lt_channel(id: str = Query(...)):
+    mod = _lt_require()
     cid = id.strip()
-    if cid.startswith("@"):
-        path = f"/c/{cid[1:]}"
-    elif cid.startswith("UC"):
-        path = f"/channel/{cid}"
-    else:
-        path = f"/channel/{cid}"
-    data, inst = await _piped_get(path)
+    path = f"/c/{cid[1:]}" if cid.startswith("@") else f"/channel/{cid}"
+    try:
+        data, inst = await mod.piped_path(path)
+    except Exception as e:
+        return ok({"error": str(e)[:200]}, provider="libretube", endpoint="channel")
     return ok(data if isinstance(data, dict) else {"data": data}, provider="libretube", endpoint="channel", instance=inst)
 
 @app.get("/lt/playlist", tags=["LibreTube"])
 async def lt_playlist(id: str = Query(...)):
-    data, inst = await _piped_get(f"/playlists/{id.strip()}")
+    mod = _lt_require()
+    try:
+        data, inst = await mod.piped_path(f"/playlists/{id.strip()}")
+    except Exception as e:
+        return ok({"error": str(e)[:200]}, provider="libretube", endpoint="playlist")
     return ok(data if isinstance(data, dict) else {"data": data}, provider="libretube", endpoint="playlist", instance=inst)
 
 @app.get("/lt/sponsorblock", tags=["LibreTube"])
-async def lt_sponsorblock(id: str = Query(..., description="YouTube video id")):
-    """SponsorBlock segments (LibreTube skip segments)."""
-    vid = id.strip()
-    async with _client(12.0) as client:
-        r = await client.get(f"{SPONSOR_API}/skipSegments", params={"videoID": vid}, headers={"User-Agent": UA})
+async def lt_sponsorblock(id: str = Query(...)):
+    mod = _lt_require()
+    vid = mod.extract_video_id(id)
+    async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
+        r = await client.get(f"{mod.SPONSOR_API}/skipSegments", params={"videoID": vid}, headers={"User-Agent": mod.UA})
         if r.status_code == 404:
-            return ok({"videoId": vid, "segments": [], "count": 0}, provider="sponsorblock", endpoint="skipSegments")
+            return ok({"videoId": vid, "segments": [], "count": 0}, provider="sponsorblock")
         if r.status_code >= 400:
             return ok({"videoId": vid, "segments": [], "error": f"HTTP {r.status_code}"}, provider="sponsorblock")
         data = r.json()
-    return ok({"videoId": vid, "segments": data if isinstance(data, list) else data, "count": len(data) if isinstance(data, list) else 0},
-              provider="sponsorblock", endpoint="skipSegments")
+    return ok({"videoId": vid, "segments": data if isinstance(data, list) else data,
+               "count": len(data) if isinstance(data, list) else 0}, provider="sponsorblock", endpoint="skipSegments")
 
 @app.get("/lt/thumbnail", tags=["LibreTube"])
 async def lt_thumbnail(id: str = Query(...)):
-    """DeArrow / high-quality thumbnail helper."""
-    vid = id.strip()
+    mod = _lt_require()
+    vid = mod.extract_video_id(id)
     return ok({
         "videoId": vid,
         "yt_hq": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg",
         "yt_max": f"https://i.ytimg.com/vi/{vid}/maxresdefault.jpg",
-        "dearrow": f"{DEARROW_THUMB}?videoID={vid}",
+        "dearrow": f"{mod.DEARROW_THUMB}?videoID={vid}",
     }, provider="libretube", endpoint="thumbnail")
-
-# --- SoundCloud (LibreTube external) ---
-async def _sc_client_id() -> str:
-    global _lt_sc_client_id
-    if _lt_sc_client_id:
-        return _lt_sc_client_id
-    # try scrape from soundcloud web
-    try:
-        async with _client(15.0) as client:
-            r = await client.get("https://soundcloud.com", headers={"User-Agent": UA})
-            html = r.text
-            # find script urls then client_id
-            scripts = re.findall(r'src="(https://a-v2\.sndcdn\.com/assets/[^"]+\.js)"', html)
-            for su in scripts[:8]:
-                try:
-                    js = (await client.get(su, headers={"User-Agent": UA})).text
-                    m = re.search(r'client_id["\s:=]+["\']([a-zA-Z0-9]{32})["\']', js)
-                    if m:
-                        _lt_sc_client_id = m.group(1)
-                        return _lt_sc_client_id
-                except Exception:
-                    continue
-    except Exception:
-        pass
-    return SC_CLIENT_IDS[0]
-
-async def _sc_get(path: str, params: Optional[dict] = None) -> dict:
-    cid = await _sc_client_id()
-    p = dict(params or {})
-    p["client_id"] = cid
-    async with _client(18.0) as client:
-        r = await client.get(SC_API + path, params=p, headers={"User-Agent": UA, "Accept": "application/json"})
-        if r.status_code == 401:
-            # rotate fallback
-            p["client_id"] = SC_CLIENT_IDS[0]
-            r = await client.get(SC_API + path, params=p, headers={"User-Agent": UA})
-        if r.status_code >= 400:
-            raise HTTPException(502, detail=fail("SoundCloud error", status=r.status_code, body=r.text[:200]))
-        return r.json()
 
 @app.get("/lt/sc/search", tags=["LibreTube"])
 async def lt_sc_search(q: str = Query(...), limit: int = Query(20, ge=1, le=50)):
-    """SoundCloud track search (LibreTube)."""
-    data = await _sc_get("/search/tracks", {"q": q, "limit": limit})
+    mod = _lt_require()
+    try:
+        data = await mod.sc_get("/search/tracks", {"q": q, "limit": limit})
+    except Exception as e:
+        return ok({"items": [], "error": str(e)[:200]}, provider="soundcloud", endpoint="search")
     col = data.get("collection") if isinstance(data, dict) else data
     items = []
-    for t in (col or []):
+    for tr in (col or []):
         items.append({
-            "id": t.get("id"),
-            "title": t.get("title"),
-            "user": (t.get("user") or {}).get("username"),
-            "permalink_url": t.get("permalink_url"),
-            "artwork": t.get("artwork_url"),
-            "duration_ms": t.get("duration"),
-            "streamable": t.get("streamable"),
-            "media": t.get("media"),
+            "id": tr.get("id"), "title": tr.get("title"),
+            "user": (tr.get("user") or {}).get("username"),
+            "permalink_url": tr.get("permalink_url"),
+            "artwork": tr.get("artwork_url"),
+            "duration_ms": tr.get("duration"),
+            "streamable": tr.get("streamable"),
         })
     return ok({"query": q, "items": items, "count": len(items)}, provider="soundcloud", endpoint="search")
 
 @app.get("/lt/sc/track", tags=["LibreTube"])
-async def lt_sc_track(id: str = Query(..., description="SoundCloud track id or permalink URL")):
-    """SoundCloud track details + stream progressive URL when available."""
+async def lt_sc_track(id: str = Query(...)):
+    mod = _lt_require()
     tid = id.strip()
-    if tid.startswith("http"):
-        data = await _sc_get("/resolve", {"url": tid})
-    else:
-        data = await _sc_get(f"/tracks/{tid}")
-    stream_url = None
-    # progressive transcoding
-    media = (data.get("media") or {}).get("transcodings") or []
-    progressive = None
-    for tr in media:
-        if tr.get("format", {}).get("protocol") == "progressive":
-            progressive = tr.get("url")
-            break
-    if not progressive and media:
-        progressive = media[0].get("url")
-    if progressive:
-        try:
-            cid = await _sc_client_id()
-            async with _client(15.0) as client:
-                r = await client.get(progressive, params={"client_id": cid}, headers={"User-Agent": UA})
-                if r.status_code < 400:
-                    j = r.json()
-                    stream_url = j.get("url")
-        except Exception:
-            pass
+    try:
+        if tid.startswith("http"):
+            data = await mod.sc_get("/resolve", {"url": tid})
+        else:
+            data = await mod.sc_get(f"/tracks/{tid}")
+        stream_url = await mod.sc_stream_url(data if isinstance(data, dict) else {})
+    except Exception as e:
+        return ok({"error": str(e)[:200]}, provider="soundcloud", endpoint="track")
     return ok({
-        "id": data.get("id"),
-        "title": data.get("title"),
+        "id": data.get("id"), "title": data.get("title"),
         "user": (data.get("user") or {}).get("username"),
         "artwork": data.get("artwork_url"),
         "duration_ms": data.get("duration"),
         "permalink_url": data.get("permalink_url"),
-        "stream_url": stream_url,
-        "media": media,
-        "direct_play": stream_url,
+        "stream_url": stream_url, "direct_play": stream_url,
+        "media": (data.get("media") or {}).get("transcodings"),
     }, provider="soundcloud", endpoint="track",
-       how="stream_url is progressive CDN when available — play in VLC/ExoPlayer")
+       how="stream_url = progressive CDN for ExoPlayer/VLC")
 
 @app.get("/lt/sc/charts", tags=["LibreTube"])
 async def lt_sc_charts(genre: str = Query("soundcloud:genres:all-music")):
-    data = await _sc_get("/charts", {"genre": genre, "kind": "top"})
+    mod = _lt_require()
+    try:
+        data = await mod.sc_get("/charts", {"genre": genre, "kind": "top"})
+    except Exception as e:
+        return ok({"error": str(e)[:200]}, provider="soundcloud", endpoint="charts")
     return ok(data if isinstance(data, dict) else {"data": data}, provider="soundcloud", endpoint="charts")
 
-# --- media.ccc.de ---
 @app.get("/lt/ccc/recent", tags=["LibreTube"])
 async def lt_ccc_recent():
-    async with _client(15.0) as client:
-        r = await client.get(f"{CCC_API}/public/events/recent", headers={"User-Agent": UA})
+    mod = _lt_require()
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        r = await client.get(f"{mod.CCC_API}/public/events/recent", headers={"User-Agent": mod.UA})
         data = r.json()
     events = data.get("events") if isinstance(data, dict) else data
     return ok({"events": events, "count": len(events or [])}, provider="media.ccc", endpoint="recent")
 
 @app.get("/lt/ccc/event", tags=["LibreTube"])
 async def lt_ccc_event(guid: str = Query(...)):
-    """CCC event detail including recordings (CDN mp4/webm)."""
-    async with _client(15.0) as client:
-        r = await client.get(f"{CCC_API}/public/events/{guid}", headers={"User-Agent": UA})
+    mod = _lt_require()
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        r = await client.get(f"{mod.CCC_API}/public/events/{guid}", headers={"User-Agent": mod.UA})
         if r.status_code >= 400:
-            raise HTTPException(502, detail=fail("CCC event failed", status=r.status_code))
+            return ok({"error": f"HTTP {r.status_code}"}, provider="media.ccc", endpoint="event")
         data = r.json()
     recordings = []
     for rec in (data.get("recordings") or []):
         recordings.append({
             "url": rec.get("recording_url") or rec.get("url"),
-            "mime": rec.get("mime_type"),
-            "size": rec.get("size"),
-            "length": rec.get("length"),
-            "language": rec.get("language"),
-            "high_quality": rec.get("high_quality"),
-            "width": rec.get("width"),
-            "height": rec.get("height"),
+            "mime": rec.get("mime_type"), "size": rec.get("size"),
+            "length": rec.get("length"), "language": rec.get("language"),
+            "width": rec.get("width"), "height": rec.get("height"),
         })
     return ok({
-        "guid": data.get("guid"),
-        "title": data.get("title"),
-        "description": (data.get("description") or "")[:500],
-        "thumb": data.get("thumb_url"),
-        "recordings": recordings,
+        "guid": data.get("guid"), "title": data.get("title"),
+        "thumb": data.get("thumb_url"), "recordings": recordings,
         "cdn_count": len([x for x in recordings if x.get("url")]),
         "direct_play": next((x["url"] for x in recordings if x.get("url")), None),
     }, provider="media.ccc", endpoint="event")
 
 @app.get("/lt/ccc/conferences", tags=["LibreTube"])
 async def lt_ccc_conferences():
-    async with _client(15.0) as client:
-        r = await client.get(f"{CCC_API}/public/conferences", headers={"User-Agent": UA})
+    mod = _lt_require()
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        r = await client.get(f"{mod.CCC_API}/public/conferences", headers={"User-Agent": mod.UA})
         data = r.json()
     confs = data.get("conferences") if isinstance(data, dict) else data
     return ok({"conferences": confs, "count": len(confs or [])}, provider="media.ccc", endpoint="conferences")
 
-# --- Bandcamp (LibreTube) ---
 @app.get("/lt/bc/search", tags=["LibreTube"])
 async def lt_bc_search(q: str = Query(...)):
-    """Bandcamp autocomplete search."""
-    async with _client(15.0) as client:
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
         r = await client.get(
             "https://bandcamp.com/api/bcsearch_public_api/1/autocomplete_elastic",
             params={"q": q, "fn": "search", "size": 20},
             headers={"User-Agent": UA},
         )
         if r.status_code >= 400:
-            raise HTTPException(502, detail=fail("Bandcamp search failed", status=r.status_code))
+            return ok({"error": f"HTTP {r.status_code}"}, provider="bandcamp", endpoint="search")
         data = r.json()
     return ok(data if isinstance(data, dict) else {"results": data}, provider="bandcamp", endpoint="search")
 
 @app.get("/lt/instances", tags=["LibreTube"])
 async def lt_instances():
-    """Configured Piped instances (LibreTube style)."""
+    mod = _lt_require()
     return ok({
-        "piped": PIPED_INSTANCES,
-        "soundcloud": SC_API,
-        "ccc": CCC_API,
-        "sponsorblock": SPONSOR_API,
-        "note": "Stream extraction may fail when YouTube bot-checks instance IPs; trending/search usually work.",
+        "invidious": mod.INVIDIOUS_INSTANCES,
+        "piped": mod.PIPED_INSTANCES,
+        "soundcloud": mod.SC_API,
+        "ccc": mod.CCC_API,
+        "note": "Streams prefer Invidious (googlevideo CDN). Piped used for catalog + fallback.",
     }, provider="libretube", endpoint="instances")
 
 
@@ -5060,7 +4972,7 @@ footer{text-align:center;color:var(--mu);font-size:12px;padding:20px 0 10px}
 </head>
 <body>
 <header class="top">
-  <div class="brand"><div class="logo">SH</div><div><h1>StreamHub API</h1><small>v8.4.3 · creator: shawon</small></div></div>
+  <div class="brand"><div class="logo">SH</div><div><h1>StreamHub API</h1><small>v8.4.5 · creator: shawon</small></div></div>
   <div class="search"><span style="opacity:.4;font-size:13px">⌕</span><input id="q" placeholder="Filter endpoints…" oninput="filt()"/></div>
 </header>
 <div class="tabs" id="tabs"></div>
@@ -5112,7 +5024,8 @@ const E = [
 {g:'LibreTube',p:'/lt/trending',how:'YouTube trending via Piped.',params:[{n:'region',v:'US'}]},
 {g:'LibreTube',p:'/lt/search',how:'Search videos/channels/playlists.',params:[{n:'q',v:'despacito'}]},
 {g:'LibreTube',p:'/lt/suggestions',how:'Search autocomplete.',params:[{n:'query',v:'despa'}]},
-{g:'LibreTube',p:'/lt/streams',how:'CDN video+audio streams for video id.',params:[{n:'id',v:'kJQP7kiw5Fk'}]},
+{g:'LibreTube',p:'/lt/streams',how:'CDN streams + qualities[] (muxed/paired with audio).',params:[{n:'id',v:'kJQP7kiw5Fk'}]},
+{g:'LibreTube',p:'/lt/play',how:'Pick quality with audio. quality=best|720|360',params:[{n:'id',v:'kJQP7kiw5Fk'},{n:'quality',v:'720'}]},
 {g:'LibreTube',p:'/lt/comments',how:'Video comments.',params:[{n:'id',v:'kJQP7kiw5Fk'}]},
 {g:'LibreTube',p:'/lt/channel',how:'Channel by UC id.',params:[{n:'id',v:'UC4R8DWoMoI7CAwX8_LjQHig'}]},
 {g:'LibreTube',p:'/lt/playlist',how:'Playlist by id.',params:[{n:'id',v:'PLrAXtmRdnEQy6nuLMO'}]},
