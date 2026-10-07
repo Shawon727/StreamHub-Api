@@ -1011,7 +1011,7 @@ input,textarea{width:100%;background:#0e1220;border:1px solid var(--line);border
 </div>
 <div class="panel" id="p-up">
 <div class="card"><h2>Upload file</h2>
-<div class="alert">বড় ফাইল → <code>/tg/upload/path</code> (সার্ভার পাথ)</div>
+<div class="alert">Big file → <code>/tg/upload/path</code> (server path)</div>
 <label>File</label><input type="file" id="file"/>
 <label>Title</label><input id="ut"/>
 <label>Tags</label><input id="ug"/>
