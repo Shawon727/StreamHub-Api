@@ -1,4 +1,4 @@
-# StreamHub API v8.4.8 — creator: shawon
+# StreamHub API v8.5.0 — creator: shawon (+ Telegram CDN)
 from __future__ import annotations
 
 import asyncio, base64, gzip, hashlib, hmac, json, random, re, time, uuid
@@ -13,13 +13,36 @@ try:
 except ImportError:
     LT = None  # type: ignore
 
+try:
+    from telegram_cdn_api import router as tg_router, init_tg_cdn, DATA_DIR as TG_DATA_DIR
+    TG_CDN = True
+except ImportError:
+    tg_router = None  # type: ignore
+    init_tg_cdn = None  # type: ignore
+    TG_DATA_DIR = None
+    TG_CDN = False
+
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response, StreamingResponse, PlainTextResponse
 
-CREATOR, VERSION = "shawon", "8.4.8"
-app = FastAPI(title="StreamHub API", version=VERSION, docs_url=None, redoc_url=None)
+CREATOR, VERSION = "shawon", "8.5.0"
+app = FastAPI(title="StreamHub API", version=VERSION, docs_url="/docs", redoc_url="/redoc")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# Telegram CDN routes: /tg/*
+if TG_CDN and tg_router is not None:
+    app.include_router(tg_router)
+    print(f"[StreamHub] Telegram CDN mounted → /tg/* | data={TG_DATA_DIR}")
+
+    @app.on_event("startup")
+    async def _tg_cdn_startup():
+        if init_tg_cdn:
+            try:
+                await init_tg_cdn()
+            except Exception as e:
+                print(f"[StreamHub] TG CDN startup: {e}")
+
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 MOBILE_UA = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36"
 
@@ -3731,7 +3754,19 @@ async def kt_info():
 
 @app.get("/health", tags=["Meta"])
 async def health():
-    return ok({"version": VERSION, "providers": ["moviebox", "4khdhub", "hubcloud", "dramachi", "iptv", "hentaicity", "hindianime", "kartoons", "tools", "aggregate"]})
+    providers = ["moviebox", "4khdhub", "hubcloud", "dramachi", "iptv", "hentaicity", "hindianime", "kartoons", "tools", "aggregate"]
+    if TG_CDN:
+        providers.append("telegram_cdn")
+    return ok({
+        "version": VERSION,
+        "providers": providers,
+        "telegram_cdn": {
+            "enabled": TG_CDN,
+            "ui": "/tg/ui",
+            "docs": "/tg/health",
+            "data_dir": str(TG_DATA_DIR) if TG_DATA_DIR else None,
+        },
+    })
 
 # ========== Stream proxy (needed for DASH cookies, CORS-blocked HLS, IP-locked MP4) ==========
 from fastapi import Request
