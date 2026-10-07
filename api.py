@@ -1,4 +1,4 @@
-# StreamHub API v8.4.7 — creator: shawon
+# StreamHub API v8.4.8 — creator: shawon
 from __future__ import annotations
 
 import asyncio, base64, gzip, hashlib, hmac, json, random, re, time, uuid
@@ -17,7 +17,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response, StreamingResponse, PlainTextResponse
 
-CREATOR, VERSION = "shawon", "8.4.7"
+CREATOR, VERSION = "shawon", "8.4.8"
 app = FastAPI(title="StreamHub API", version=VERSION, docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -4984,6 +4984,757 @@ async def lt_instances():
     }, provider="libretube", endpoint="instances")
 
 
+
+# ========== ANIMEPIRATES / STREAMVAULT (animepirates.in) ==========
+# Backend: Supabase https://supabase.streamvault.in.net + TanStack serverFn
+AP_SITE = "https://animepirates.in"
+AP_SB = "https://supabase.streamvault.in.net"
+AP_ANON = (
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+    "eyJyb2xlIjoiYW5vbiIsImlzcyI6InN1cGFiYXNlIiwiaWF0IjoxNzg2MzUzNDI0LCJleHAiOjE5NDQwMzM0MjR9."
+    "dWc1DMXdhMyuqanzZElUpm0-I1ceziPohA_HCx1pPZ0"
+)
+# Homepage catalog serverFn (no auth)
+AP_FN_HOME = "45d432383bd40f9c013038498e3572540176c13bb3807ac8f954af80dee249d9"
+AP_FN_HERO = "562bc112699f0eef33e46e4e0d1fb00b605008cd10822c4f4d3db6929832776f"
+# Stream resolve for logged-in users (POST + application/json) → streamUrl/downloadUrl CDN
+AP_FN_STREAM_PLAY = "90b45d2cdeb583eda608dc202da5b145fcd972a70997764f2d4d81162a862a33"
+# Admin-only stream helpers (not used by public clients)
+AP_FN_STREAM = "0484adc8b786e1d876b095bd07e8dd3e6788a826f115acd96c1bd8b3e59c6ce3"
+AP_FN_STREAM_POST = "3c1407ed1d6b6ad4739fe143b13267f2d09608101f7d172924be8dc2406b1a52"
+# Download deep-link via Telegram bot
+AP_FN_DL_GET = "870f536ac1e063d69e821b808cdbcead745a32ddfd95f2ccb9b50df20ec7d177"
+AP_AUTH = f"{AP_SB}/auth/v1"
+AP_BOT = "nobi3bot"
+
+def _ap_sb_headers(token: Optional[str] = None) -> dict:
+    tok = (token or AP_ANON).strip()
+    if tok.lower().startswith("bearer "):
+        tok = tok[7:].strip()
+    return {
+        "apikey": AP_ANON,
+        "Authorization": f"Bearer {tok}",
+        "Accept": "application/json",
+        "User-Agent": UA,
+    }
+
+def _ap_fn_headers(token: Optional[str] = None) -> dict:
+    h = {
+        "User-Agent": UA,
+        "Accept": "application/x-tss-framed, application/x-ndjson, application/json",
+        "x-tsr-serverfn": "true",
+        "Referer": AP_SITE + "/",
+        "Origin": AP_SITE,
+    }
+    if token:
+        tok = token.strip()
+        if not tok.lower().startswith("bearer "):
+            tok = f"Bearer {tok}"
+        h["Authorization"] = tok
+    return h
+
+def _ap_auth_headers() -> dict:
+    return {
+        "apikey": AP_ANON,
+        "Authorization": f"Bearer {AP_ANON}",
+        "Content-Type": "application/json",
+        "User-Agent": UA,
+    }
+
+def _seroval_decode(node, refs=None):
+    """Best-effort decode of TanStack seroval JSON tree → Python."""
+    if refs is None:
+        refs = {}
+    if not isinstance(node, dict):
+        return node
+    t = node.get("t")
+    if t == 1:  # string
+        return node.get("s")
+    if t == 0:  # number-like
+        s = node.get("s")
+        try:
+            return int(s)
+        except Exception:
+            try:
+                return float(s)
+            except Exception:
+                return s
+    if t == 2:  # boolean-ish (site uses s:2 for true in some places)
+        return node.get("s") in (2, True, "true", 1)
+    if t == 9:  # array
+        return [_seroval_decode(x, refs) for x in (node.get("a") or [])]
+    if t == 10:  # object
+        keys = (node.get("p") or {}).get("k") or []
+        vals = (node.get("p") or {}).get("v") or []
+        out = {}
+        for k, v in zip(keys, vals):
+            out[k] = _seroval_decode(v, refs)
+        return out
+    if t == 25:  # error
+        return {"error": _seroval_decode((node.get("s") or {}).get("message"), refs)}
+    return node
+
+def _seroval_result(body: dict):
+    if not isinstance(body, dict):
+        return body
+    decoded = _seroval_decode(body)
+    if isinstance(decoded, dict) and "result" in decoded:
+        return decoded.get("result"), decoded.get("error")
+    return decoded, None
+
+def _seroval_payload(data: dict) -> str:
+    keys = list(data.keys())
+    vals = []
+    for k in keys:
+        v = data[k]
+        if isinstance(v, str):
+            vals.append({"t": 1, "s": v})
+        elif isinstance(v, bool):
+            vals.append({"t": 2, "s": 2 if v else 1})
+        elif isinstance(v, int):
+            vals.append({"t": 0, "s": v})
+        else:
+            vals.append({"t": 1, "s": str(v)})
+    inner = {"t": 10, "i": 1, "p": {"k": keys, "v": vals}, "o": 0}
+    root = {"t": 10, "i": 0, "p": {"k": ["data"], "v": [inner]}, "o": 0}
+    return json.dumps({"t": root, "f": 127, "m": []})
+
+async def _ap_sb(path: str, params: Optional[dict] = None) -> Any:
+    url = AP_SB.rstrip("/") + "/rest/v1/" + path.lstrip("/")
+    async with _client(20.0) as client:
+        r = await client.get(url, params=params or {}, headers=_ap_sb_headers())
+        if r.status_code >= 400:
+            raise HTTPException(502, detail=fail("AnimePirates Supabase error", status=r.status_code, body=r.text[:200]))
+        return r.json()
+
+async def _ap_fn_get(fn_hash: str, data: Optional[dict] = None, token: Optional[str] = None) -> Any:
+    url = f"{AP_SITE}/_serverFn/{fn_hash}"
+    params = {}
+    if data is not None:
+        params["payload"] = _seroval_payload(data)
+    async with _client(20.0) as client:
+        r = await client.get(url, params=params or None, headers=_ap_fn_headers(token))
+        if r.status_code >= 400:
+            return None, f"HTTP {r.status_code}"
+        try:
+            body = r.json()
+        except Exception:
+            return None, "non-json"
+        return _seroval_result(body)
+
+async def _ap_fn_post(fn_hash: str, data: Optional[dict] = None, token: Optional[str] = None) -> Any:
+    """POST serverFn with application/json seroval body (required for stream play)."""
+    url = f"{AP_SITE}/_serverFn/{fn_hash}"
+    body = _seroval_payload(data or {})
+    headers = {**_ap_fn_headers(token), "Content-Type": "application/json"}
+    async with _client(30.0) as client:
+        r = await client.post(url, content=body, headers=headers)
+        if r.status_code >= 400:
+            try:
+                return _seroval_result(r.json())
+            except Exception:
+                return None, f"HTTP {r.status_code}: {r.text[:180]}"
+        try:
+            return _seroval_result(r.json())
+        except Exception:
+            return None, "non-json"
+
+async def _ap_auth_request(method: str, path: str, payload: Optional[dict] = None, token: Optional[str] = None) -> tuple:
+    """Call Supabase Auth API. Returns (json|None, error|None, status)."""
+    url = f"{AP_AUTH}/{path.lstrip('/')}"
+    headers = _ap_auth_headers()
+    if token:
+        tok = token.strip()
+        if tok.lower().startswith("bearer "):
+            tok = tok[7:].strip()
+        headers["Authorization"] = f"Bearer {tok}"
+    async with _client(20.0) as client:
+        if method.upper() == "GET":
+            r = await client.get(url, headers=headers)
+        elif method.upper() == "POST":
+            r = await client.post(url, headers=headers, json=payload or {})
+        else:
+            r = await client.request(method.upper(), url, headers=headers, json=payload)
+        try:
+            data = r.json()
+        except Exception:
+            data = {"raw": r.text[:300]}
+        if r.status_code >= 400:
+            msg = data.get("msg") or data.get("error_description") or data.get("error") or data.get("message") or r.text[:200]
+            return data, str(msg), r.status_code
+        return data, None, r.status_code
+
+# ---- Auth (Supabase GoTrue on streamvault) ----
+@app.post("/ap/auth/signup", tags=["AnimePirates Auth"])
+async def ap_auth_signup(
+    email: str = Query(..., min_length=5, description="Email address"),
+    password: str = Query(..., min_length=6, description="Password (min 6 chars)"),
+):
+    """
+    Create a free account on AnimePirates (Supabase). Email auto-confirmed.
+    Returns access_token + refresh_token — use access_token as ?auth= on /ap/stream.
+    """
+    data, err, status = await _ap_auth_request("POST", "signup", {
+        "email": email.strip().lower(),
+        "password": password,
+    })
+    if err:
+        raise HTTPException(status if status >= 400 else 400, detail=fail("signup failed", error=err, raw=data))
+    user = (data or {}).get("user") or {}
+    return ok({
+        "access_token": (data or {}).get("access_token"),
+        "refresh_token": (data or {}).get("refresh_token"),
+        "expires_in": (data or {}).get("expires_in"),
+        "expires_at": (data or {}).get("expires_at"),
+        "token_type": (data or {}).get("token_type") or "bearer",
+        "user": {
+            "id": user.get("id"),
+            "email": user.get("email"),
+            "email_confirmed_at": user.get("email_confirmed_at"),
+            "role": user.get("role"),
+        },
+        "how": "Use access_token: GET /ap/stream?media_id=UUID&auth=ACCESS_TOKEN",
+        "login_ui": "/ap/auth/ui",
+    }, provider="animepirates", endpoint="auth_signup")
+
+@app.post("/ap/auth/login", tags=["AnimePirates Auth"])
+async def ap_auth_login(
+    email: str = Query(..., min_length=5),
+    password: str = Query(..., min_length=6),
+):
+    """Login with email/password. Returns access_token (1h) + refresh_token."""
+    data, err, status = await _ap_auth_request("POST", "token?grant_type=password", {
+        "email": email.strip().lower(),
+        "password": password,
+    })
+    if err:
+        raise HTTPException(status if status >= 400 else 401, detail=fail("login failed", error=err, raw=data))
+    user = (data or {}).get("user") or {}
+    return ok({
+        "access_token": (data or {}).get("access_token"),
+        "refresh_token": (data or {}).get("refresh_token"),
+        "expires_in": (data or {}).get("expires_in"),
+        "expires_at": (data or {}).get("expires_at"),
+        "token_type": (data or {}).get("token_type") or "bearer",
+        "user": {
+            "id": user.get("id"),
+            "email": user.get("email"),
+            "role": user.get("role"),
+        },
+        "how": "GET /ap/stream?media_id=UUID&auth=ACCESS_TOKEN",
+    }, provider="animepirates", endpoint="auth_login")
+
+@app.post("/ap/auth/refresh", tags=["AnimePirates Auth"])
+async def ap_auth_refresh(refresh_token: str = Query(..., min_length=8)):
+    """Refresh expired access_token using refresh_token."""
+    data, err, status = await _ap_auth_request("POST", "token?grant_type=refresh_token", {
+        "refresh_token": refresh_token,
+    })
+    if err:
+        raise HTTPException(status if status >= 400 else 401, detail=fail("refresh failed", error=err, raw=data))
+    return ok({
+        "access_token": (data or {}).get("access_token"),
+        "refresh_token": (data or {}).get("refresh_token"),
+        "expires_in": (data or {}).get("expires_in"),
+        "expires_at": (data or {}).get("expires_at"),
+        "token_type": (data or {}).get("token_type") or "bearer",
+    }, provider="animepirates", endpoint="auth_refresh")
+
+@app.get("/ap/auth/me", tags=["AnimePirates Auth"])
+async def ap_auth_me(auth: str = Query(..., description="access_token")):
+    """Get current user profile from access_token."""
+    tok = auth.strip()
+    if tok.lower().startswith("bearer "):
+        tok = tok[7:].strip()
+    data, err, status = await _ap_auth_request("GET", "user", token=tok)
+    if err:
+        raise HTTPException(status if status >= 400 else 401, detail=fail("invalid token", error=err))
+    return ok({
+        "user": {
+            "id": (data or {}).get("id"),
+            "email": (data or {}).get("email"),
+            "role": (data or {}).get("role"),
+            "email_confirmed_at": (data or {}).get("email_confirmed_at"),
+            "last_sign_in_at": (data or {}).get("last_sign_in_at"),
+            "app_metadata": (data or {}).get("app_metadata"),
+            "user_metadata": (data or {}).get("user_metadata"),
+        },
+    }, provider="animepirates", endpoint="auth_me")
+
+@app.post("/ap/auth/logout", tags=["AnimePirates Auth"])
+async def ap_auth_logout(auth: str = Query(..., description="access_token")):
+    """Invalidate current session."""
+    tok = auth.strip()
+    if tok.lower().startswith("bearer "):
+        tok = tok[7:].strip()
+    data, err, status = await _ap_auth_request("POST", "logout", token=tok)
+    return ok({"logged_out": err is None, "error": err, "status": status},
+              provider="animepirates", endpoint="auth_logout")
+
+@app.get("/ap/auth/ui", tags=["AnimePirates Auth"], response_class=HTMLResponse)
+async def ap_auth_ui():
+    """Simple login / signup page. Saves token in localStorage and can open stream test."""
+    html = """<!DOCTYPE html>
+<html lang="bn"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>AnimePirates Login — StreamHub</title>
+<style>
+:root{--bg:#0b0b0f;--card:#15151c;--fg:#f2f2f7;--muted:#9a9aad;--acc:#7c5cff;--ok:#22c55e;--err:#ef4444}
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--fg);min-height:100vh;display:grid;place-items:center;padding:16px}
+.card{width:100%;max-width:420px;background:var(--card);border-radius:16px;padding:24px;box-shadow:0 8px 32px #0006}
+h1{font-size:1.25rem;margin:0 0 4px}p.sub{color:var(--muted);font-size:.85rem;margin:0 0 20px}
+label{display:block;font-size:.8rem;color:var(--muted);margin:12px 0 4px}
+input{width:100%;padding:12px 14px;border-radius:10px;border:1px solid #2a2a35;background:#0e0e14;color:var(--fg);font-size:1rem}
+.row{display:flex;gap:8px;margin-top:16px}
+button{flex:1;padding:12px;border:0;border-radius:10px;font-weight:600;cursor:pointer;font-size:.95rem}
+.btn{background:var(--acc);color:#fff}.btn2{background:#2a2a35;color:var(--fg)}
+.msg{margin-top:14px;padding:10px 12px;border-radius:8px;font-size:.85rem;display:none;white-space:pre-wrap;word-break:break-all}
+.msg.ok{display:block;background:#14532d33;color:var(--ok);border:1px solid #22c55e44}
+.msg.err{display:block;background:#7f1d1d33;color:var(--err);border:1px solid #ef444444}
+.tok{margin-top:12px;font-size:.75rem;color:var(--muted)}
+.tok code{display:block;background:#0e0e14;padding:8px;border-radius:8px;margin-top:4px;max-height:80px;overflow:auto}
+a{color:var(--acc)}
+</style></head><body>
+<div class="card">
+<h1>AnimePirates Login</h1>
+<p class="sub">Account না থাকলে Sign up · থাকলে Login · Token দিয়ে CDN stream চালু</p>
+<label>Email</label>
+<input id="email" type="email" placeholder="you@email.com" autocomplete="email"/>
+<label>Password (min 6)</label>
+<input id="pass" type="password" placeholder="••••••••" autocomplete="current-password" minlength="6"/>
+<div class="row">
+<button class="btn" id="login">Login</button>
+<button class="btn2" id="signup">Sign up</button>
+</div>
+<div class="msg" id="msg"></div>
+<div class="tok" id="tokbox" style="display:none">
+access_token:
+<code id="tok"></code>
+<div class="row" style="margin-top:10px">
+<button class="btn2" id="copy">Copy token</button>
+<button class="btn" id="test">Test stream</button>
+</div>
+<p style="font-size:.75rem;color:var(--muted);margin-top:10px">
+API: <code>POST /ap/auth/login?email=…&amp;password=…</code><br/>
+Stream: <code>GET /ap/stream?media_id=…&amp;auth=TOKEN</code>
+</p>
+</div>
+</div>
+<script>
+const msg=document.getElementById('msg'), tokbox=document.getElementById('tokbox'), tokEl=document.getElementById('tok');
+function show(t,ok){msg.className='msg '+(ok?'ok':'err');msg.textContent=t}
+async function call(path){
+  const email=document.getElementById('email').value.trim();
+  const password=document.getElementById('pass').value;
+  if(!email||password.length<6){show('Email + password (min 6) লাগবে',false);return}
+  msg.className='msg';msg.textContent='Loading…';msg.style.display='block';
+  try{
+    const r=await fetch(path+'?email='+encodeURIComponent(email)+'&password='+encodeURIComponent(password),{method:'POST'});
+    const j=await r.json();
+    const d=j.data||j;
+    if(!r.ok){show((j.detail&&(j.detail.error||j.detail.message))||j.error||JSON.stringify(j).slice(0,200),false);return}
+    const at=d.access_token; if(!at){show('No token in response: '+JSON.stringify(d).slice(0,200),false);return}
+    localStorage.setItem('ap_access_token',at);
+    if(d.refresh_token) localStorage.setItem('ap_refresh_token',d.refresh_token);
+    tokEl.textContent=at; tokbox.style.display='block';
+    show('Success! User: '+(d.user&&d.user.email||email)+'\\nToken saved to localStorage.',true);
+  }catch(e){show(String(e),false)}
+}
+document.getElementById('login').onclick=()=>call('/ap/auth/login');
+document.getElementById('signup').onclick=()=>call('/ap/auth/signup');
+document.getElementById('copy').onclick=()=>{navigator.clipboard.writeText(tokEl.textContent);show('Token copied',true)};
+document.getElementById('test').onclick=()=>{
+  const t=tokEl.textContent||localStorage.getItem('ap_access_token');
+  const mid=prompt('media_id (uuid from /ap/media)','0000be10-63df-4149-9d7b-85b9d207381e');
+  if(!mid||!t)return;
+  window.open('/ap/stream?media_id='+encodeURIComponent(mid)+'&auth='+encodeURIComponent(t),'_blank');
+};
+const saved=localStorage.getItem('ap_access_token');
+if(saved){tokEl.textContent=saved;tokbox.style.display='block'}
+</script>
+</body></html>"""
+    return HTMLResponse(html)
+
+@app.get("/ap/health", tags=["AnimePirates"])
+async def ap_health():
+    async with _client(12.0) as client:
+        r = await client.get(f"{AP_SITE}/api/public/health", headers={"User-Agent": UA})
+        site = r.json() if r.status_code < 400 else {"status": r.status_code}
+    return ok({"site": site, "supabase": AP_SB, "source": AP_SITE, "auth": "email+google", "cdn": "vybeprints"}, provider="animepirates", endpoint="health")
+
+@app.get("/ap/home", tags=["AnimePirates"])
+async def ap_home():
+    """Full homepage catalog: featured, trending, latest, movies, series, anime, fandub, recents + hero slides."""
+    hero, herr = await _ap_fn_get(AP_FN_HERO)
+    home, err = await _ap_fn_get(AP_FN_HOME)
+    return ok({
+        "hero": hero,
+        "catalog": home,
+        "errors": [x for x in (herr, err) if x],
+        "how": "Use slug with /ap/title?slug=... then /ap/media?title_id= for files",
+    }, provider="animepirates", endpoint="home")
+
+@app.get("/ap/search", tags=["AnimePirates"])
+async def ap_search(
+    q: str = Query(..., min_length=1),
+    category: str = Query("", description="anime|movie|series|kdrama|cartoon|documentary"),
+    limit: int = Query(24, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+):
+    """Search master_titles (ilike title/original_title)."""
+    params = {
+        "select": "id,slug,title,original_title,category,poster_url,backdrop_url,rating,release_year,is_trending,is_featured,is_premium,genres,overview",
+        "status": "eq.published",
+        "or": f"(title.ilike.*{q}*,original_title.ilike.*{q}*)",
+        "limit": str(limit),
+        "offset": str(offset),
+        "order": "view_count.desc",
+    }
+    if category:
+        params["category"] = f"eq.{category}"
+    # PostgREST or filter needs Prefer headers sometimes — use two queries fallback
+    try:
+        data = await _ap_sb("master_titles", params)
+    except Exception:
+        params.pop("or", None)
+        params["title"] = f"ilike.*{q}*"
+        data = await _ap_sb("master_titles", params)
+    return ok({"query": q, "items": data, "count": len(data or [])}, provider="animepirates", endpoint="search")
+
+@app.get("/ap/browse", tags=["AnimePirates"])
+async def ap_browse(
+    category: str = Query("anime", description="anime|movie|series|kdrama|cartoon|documentary"),
+    limit: int = Query(24, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    trending: bool = Query(False),
+    featured: bool = Query(False),
+):
+    """Browse catalog by category (same as site /browse/anime etc)."""
+    params = {
+        "select": "id,slug,title,category,poster_url,backdrop_url,rating,release_year,is_trending,is_featured,is_premium,genres,overview,view_count",
+        "status": "eq.published",
+        "category": f"eq.{category}",
+        "limit": str(limit),
+        "offset": str(offset),
+        "order": "updated_at.desc",
+    }
+    if trending:
+        params["is_trending"] = "eq.true"
+    if featured:
+        params["is_featured"] = "eq.true"
+    data = await _ap_sb("master_titles", params)
+    return ok({"category": category, "items": data, "count": len(data or [])}, provider="animepirates", endpoint="browse")
+
+@app.get("/ap/title", tags=["AnimePirates"])
+async def ap_title(slug: str = Query(..., description="e.g. demon-slayer-kimetsu-no-yaiba-2019")):
+    """Title detail + nested media_files summary + seasons."""
+    params = {
+        "select": "*,media_files(id,file_name,caption,quality,resolution,language,file_size,is_active,is_premium,episode_id,mime_type,duration_seconds),seasons(id,season_number,name,episode_count,poster_url,is_premium)",
+        "slug": f"eq.{slug}",
+        "status": "eq.published",
+    }
+    data = await _ap_sb("master_titles", params)
+    if not data:
+        raise HTTPException(404, detail=fail("Title not found", slug=slug))
+    item = data[0]
+    return ok({
+        "title": item,
+        "site_url": f"{AP_SITE}/title/{slug}",
+        "how": "List files: /ap/media?title_id=ID · episodes: /ap/episodes?title_id=ID · stream attempt: /ap/stream?media_id=FILE_ID",
+    }, provider="animepirates", endpoint="title")
+
+@app.get("/ap/episodes", tags=["AnimePirates"])
+async def ap_episodes(
+    title_id: str = Query(...),
+    season_id: str = Query("", description="Optional season uuid"),
+):
+    """Episodes for a title (optionally filter by season)."""
+    params = {
+        "select": "id,season_id,title_id,episode_number,name,overview,still_url,air_date,runtime_minutes,is_premium,custom_text",
+        "title_id": f"eq.{title_id}",
+        "order": "episode_number.asc",
+        "limit": "500",
+    }
+    if season_id:
+        params["season_id"] = f"eq.{season_id}"
+    data = await _ap_sb("episodes", params)
+    seasons = await _ap_sb("seasons", {
+        "select": "id,season_number,name,episode_count,is_premium,poster_url",
+        "title_id": f"eq.{title_id}",
+        "order": "season_number.asc",
+    })
+    return ok({"episodes": data, "seasons": seasons, "count": len(data or [])}, provider="animepirates", endpoint="episodes")
+
+@app.get("/ap/media", tags=["AnimePirates"])
+async def ap_media(
+    title_id: str = Query("", description="Title uuid"),
+    episode_id: str = Query("", description="Episode uuid"),
+    media_id: str = Query("", description="Single media file uuid"),
+):
+    """
+    Media files (qualities) for title/episode.
+    Each file has resolution/language/size; telegram_file_id used by site stream (auth).
+    """
+    params = {
+        "select": "id,title_id,episode_id,file_name,caption,quality,resolution,language,file_size,mime_type,duration_seconds,is_active,is_premium,telegram_file_id,telegram_message_id,channel_id,created_at",
+        "is_active": "eq.true",
+        "order": "resolution.desc",
+        "limit": "1000",
+    }
+    if media_id:
+        params["id"] = f"eq.{media_id}"
+    if title_id:
+        params["title_id"] = f"eq.{title_id}"
+    if episode_id:
+        params["episode_id"] = f"eq.{episode_id}"
+    if not (media_id or title_id or episode_id):
+        raise HTTPException(400, detail=fail("Provide title_id, episode_id, or media_id"))
+    data = await _ap_sb("media_files", params)
+    # group by resolution
+    by_res = {}
+    for f in (data or []):
+        res = f.get("resolution") or f.get("quality") or "unknown"
+        by_res.setdefault(res, []).append(f)
+    return ok({
+        "files": data,
+        "count": len(data or []),
+        "by_resolution": {k: len(v) for k, v in by_res.items()},
+        "how": "Stream/download on site requires login. Try /ap/stream?media_id=ID (may need auth). Files are Telegram-backed.",
+    }, provider="animepirates", endpoint="media")
+
+@app.get("/ap/stream", tags=["AnimePirates"])
+async def ap_stream(
+    media_id: str = Query(..., description="media_files.id uuid"),
+    auth: str = Query("", description="access_token from /ap/auth/login or /ap/auth/signup"),
+):
+    """
+    Resolve playable CDN stream for a media file.
+    Requires login token (?auth=ACCESS_TOKEN). Returns streamUrl + downloadUrl (vybeprints CDN).
+    Flow: POST serverFn with mediaFileId → {ok, streamUrl, downloadUrl, fileName, mimeType}.
+    """
+    if not auth:
+        raise HTTPException(401, detail=fail(
+            "Login required for CDN stream",
+            how="POST /ap/auth/signup or /ap/auth/login → pass access_token as ?auth=TOKEN",
+            login_ui="/ap/auth/ui",
+        ))
+    files = await _ap_sb("media_files", {
+        "select": "id,title_id,episode_id,file_name,caption,quality,resolution,language,file_size,mime_type,is_premium,telegram_file_id",
+        "id": f"eq.{media_id}",
+        "limit": "1",
+    })
+    if not files:
+        raise HTTPException(404, detail=fail("media not found", media_id=media_id))
+    f = files[0]
+    result, err = await _ap_fn_post(AP_FN_STREAM_PLAY, {"mediaFileId": media_id}, token=auth)
+    stream_url = None
+    download_url = None
+    file_name = None
+    mime_type = None
+    server_id = None
+    ok_flag = False
+    if isinstance(result, dict):
+        ok_flag = bool(result.get("ok"))
+        stream_url = result.get("streamUrl") or result.get("stream_url")
+        download_url = result.get("downloadUrl") or result.get("download_url") or stream_url
+        file_name = result.get("fileName") or result.get("file_name") or f.get("file_name")
+        mime_type = result.get("mimeType") or result.get("mime_type") or f.get("mime_type")
+        server_id = result.get("serverId") or result.get("server_id")
+    err_msg = None
+    if isinstance(err, str):
+        err_msg = err
+    elif isinstance(result, dict) and result.get("error"):
+        err_msg = str(result.get("error"))
+    if not stream_url:
+        raise HTTPException(403 if auth else 401, detail=fail(
+            err_msg or "CDN stream unavailable",
+            media_id=media_id,
+            hint="Token expired? Call /ap/auth/refresh. Watch limit/premium? Check site.",
+            result=result,
+        ))
+    return ok({
+        "ok": ok_flag or True,
+        "streamUrl": stream_url,
+        "downloadUrl": download_url,
+        "direct_play": stream_url,
+        "fileName": file_name,
+        "mimeType": mime_type,
+        "serverId": server_id,
+        "media": {
+            "id": f.get("id"),
+            "title_id": f.get("title_id"),
+            "episode_id": f.get("episode_id"),
+            "resolution": f.get("resolution") or f.get("quality"),
+            "language": f.get("language"),
+            "file_size": f.get("file_size"),
+            "caption": f.get("caption"),
+            "is_premium": f.get("is_premium"),
+        },
+        "cdn_host": (stream_url.split("/")[2] if stream_url.startswith("http") else None),
+        "note": "CDN supports Range requests (HTTP 206). Use streamUrl in any player.",
+    }, provider="animepirates", endpoint="stream")
+
+@app.get("/ap/categories", tags=["AnimePirates"])
+async def ap_categories():
+    """Distinct categories from catalog."""
+    data = await _ap_sb("master_titles", {
+        "select": "category",
+        "status": "eq.published",
+        "limit": "1000",
+    })
+    cats = sorted({x.get("category") for x in (data or []) if x.get("category")})
+    return ok({
+        "categories": cats,
+        "browse_paths": [f"/browse/{c}" for c in cats],
+        "how": "/ap/browse?category=anime",
+    }, provider="animepirates", endpoint="categories")
+
+@app.get("/ap/rpc/public-browsing", tags=["AnimePirates"])
+async def ap_rpc_public_browsing():
+    async with _client(12.0) as client:
+        r = await client.post(
+            f"{AP_SB}/rest/v1/rpc/is_public_browsing_enabled",
+            headers={**_ap_sb_headers(), "Content-Type": "application/json"},
+            content="{}",
+        )
+        return ok({"enabled": r.json() if r.status_code < 400 else None, "status": r.status_code},
+                  provider="animepirates", endpoint="rpc_public_browsing")
+
+
+@app.get("/ap/download", tags=["AnimePirates"])
+async def ap_download(
+    media_id: str = Query(..., description="media_files.id uuid"),
+    auth: str = Query("", description="access_token from /ap/auth/login"),
+):
+    """
+    Resolve download URL for a media file.
+    Prefer /ap/stream which returns both streamUrl + downloadUrl on the same CDN.
+    Also returns Telegram bot deep-link (nobi3bot) when available.
+    """
+    if not auth:
+        raise HTTPException(401, detail=fail(
+            "Login required for download",
+            how="POST /ap/auth/login → pass access_token as ?auth=TOKEN",
+            login_ui="/ap/auth/ui",
+        ))
+    files = await _ap_sb("media_files", {
+        "select": "id,title_id,episode_id,file_name,caption,quality,resolution,language,file_size,mime_type,is_premium,telegram_file_id,telegram_message_id",
+        "id": f"eq.{media_id}",
+        "limit": "1",
+    })
+    if not files:
+        raise HTTPException(404, detail=fail("media not found", media_id=media_id))
+    f = files[0]
+    # Primary: same stream play endpoint returns downloadUrl
+    result, err = await _ap_fn_post(AP_FN_STREAM_PLAY, {"mediaFileId": media_id}, token=auth)
+    download_url = None
+    stream_url = None
+    if isinstance(result, dict):
+        download_url = result.get("downloadUrl") or result.get("download_url")
+        stream_url = result.get("streamUrl") or result.get("stream_url")
+        if not download_url and stream_url:
+            download_url = stream_url + ("&" if "?" in stream_url else "?") + "download=1"
+    # Secondary: Telegram bot deep-link
+    bot_result, bot_err = await _ap_fn_get(AP_FN_DL_GET, {"mediaFileId": media_id}, token=auth)
+    bot_username = AP_BOT
+    bot_link = None
+    if isinstance(bot_result, dict):
+        bot_username = bot_result.get("botUsername") or bot_result.get("bot_username") or AP_BOT
+        bot_link = bot_result.get("link")
+    return ok({
+        "ok": bool(download_url or stream_url),
+        "downloadUrl": download_url,
+        "streamUrl": stream_url,
+        "direct_download": download_url,
+        "botUsername": bot_username,
+        "botLink": bot_link,
+        "telegram_deep_link": f"https://t.me/{bot_username}" if bot_username else None,
+        "media": {
+            "id": f.get("id"),
+            "file_name": f.get("file_name"),
+            "caption": f.get("caption"),
+            "language": f.get("language"),
+            "file_size": f.get("file_size"),
+            "mime_type": f.get("mime_type"),
+            "is_premium": f.get("is_premium"),
+            "telegram_file_id": f.get("telegram_file_id"),
+        },
+        "errors": [x for x in (err, bot_err) if x],
+        "note": "Use downloadUrl in browser or download manager. Bot link opens Telegram for alternate delivery.",
+    }, provider="animepirates", endpoint="download")
+
+
+@app.get("/ap/announcements", tags=["AnimePirates"])
+async def ap_announcements():
+    """Active site announcements (support group, notices)."""
+    data = await _ap_sb("announcements", {
+        "select": "id,body,link_url,variant,is_active,starts_at,ends_at,created_at",
+        "is_active": "eq.true",
+        "order": "created_at.desc",
+        "limit": "20",
+    })
+    return ok({"announcements": data, "count": len(data or [])}, provider="animepirates", endpoint="announcements")
+
+
+@app.get("/ap/ads", tags=["AnimePirates"])
+async def ap_ads(placement: str = Query("", description="e.g. homepage_banner")):
+    """Active ad placements from site."""
+    params = {
+        "select": "id,name,placement,kind,image_url,video_url,html,link_url,sort_order,is_active",
+        "is_active": "eq.true",
+        "order": "sort_order.asc",
+        "limit": "50",
+    }
+    if placement:
+        params["placement"] = f"eq.{placement}"
+    data = await _ap_sb("ads", params)
+    return ok({"ads": data, "count": len(data or [])}, provider="animepirates", endpoint="ads")
+
+
+@app.get("/ap/seasons", tags=["AnimePirates"])
+async def ap_seasons(title_id: str = Query(...)):
+    """Seasons for a title."""
+    data = await _ap_sb("seasons", {
+        "select": "id,title_id,season_number,name,overview,poster_url,air_date,episode_count,is_premium,created_at",
+        "title_id": f"eq.{title_id}",
+        "order": "season_number.asc",
+        "limit": "100",
+    })
+    return ok({"seasons": data, "count": len(data or [])}, provider="animepirates", endpoint="seasons")
+
+
+@app.get("/ap/trending", tags=["AnimePirates"])
+async def ap_trending(
+    category: str = Query("", description="optional category filter"),
+    limit: int = Query(24, ge=1, le=100),
+):
+    """Trending titles (is_trending=true)."""
+    params = {
+        "select": "id,slug,title,category,poster_url,backdrop_url,rating,release_year,is_premium,genres,overview,view_count",
+        "status": "eq.published",
+        "is_trending": "eq.true",
+        "limit": str(limit),
+        "order": "view_count.desc",
+    }
+    if category:
+        params["category"] = f"eq.{category}"
+    data = await _ap_sb("master_titles", params)
+    return ok({"items": data, "count": len(data or [])}, provider="animepirates", endpoint="trending")
+
+
+@app.get("/ap/featured", tags=["AnimePirates"])
+async def ap_featured(limit: int = Query(12, ge=1, le=50)):
+    """Featured titles (is_featured=true)."""
+    data = await _ap_sb("master_titles", {
+        "select": "id,slug,title,category,poster_url,backdrop_url,rating,release_year,is_premium,genres,overview",
+        "status": "eq.published",
+        "is_featured": "eq.true",
+        "limit": str(limit),
+        "order": "updated_at.desc",
+    })
+    return ok({"items": data, "count": len(data or [])}, provider="animepirates", endpoint="featured")
+
+
 # ========== DOCS UI (mobile-first) ==========
 DOCS_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -5035,7 +5786,7 @@ footer{text-align:center;color:var(--mu);font-size:12px;padding:20px 0 10px}
 </head>
 <body>
 <header class="top">
-  <div class="brand"><div class="logo">SH</div><div><h1>StreamHub API</h1><small>v8.4.7 · creator: shawon</small></div></div>
+  <div class="brand"><div class="logo">SH</div><div><h1>StreamHub API</h1><small>v8.4.8 · creator: shawon</small></div></div>
   <div class="search"><span style="opacity:.4;font-size:13px">⌕</span><input id="q" placeholder="Filter endpoints…" oninput="filt()"/></div>
 </header>
 <div class="tabs" id="tabs"></div>
@@ -5106,6 +5857,29 @@ const E = [
 {g:'LibreTube',p:'/lt/ccc/conferences',how:'CCC conferences list.',params:[]},
 {g:'LibreTube',p:'/lt/bc/search',how:'Bandcamp search.',params:[{n:'q',v:'jazz'}]},
 {g:'LibreTube',p:'/lt/instances',how:'Piped/SC/CCC instance list.',params:[]},
+{g:'AnimePirates Auth',p:'/ap/auth/ui',how:'Login/Signup UI page (browser).',params:[]},
+{g:'AnimePirates Auth',p:'/ap/auth/signup',how:'Create account (POST). Returns access_token.',params:[{n:'email',v:'you@email.com'},{n:'password',v:'secret12'}]},
+{g:'AnimePirates Auth',p:'/ap/auth/login',how:'Login (POST). Returns access_token.',params:[{n:'email',v:'you@email.com'},{n:'password',v:'secret12'}]},
+{g:'AnimePirates Auth',p:'/ap/auth/refresh',how:'Refresh access_token (POST).',params:[{n:'refresh_token',v:'...'}]},
+{g:'AnimePirates Auth',p:'/ap/auth/me',how:'Current user profile.',params:[{n:'auth',v:'ACCESS_TOKEN'}]},
+{g:'AnimePirates Auth',p:'/ap/auth/logout',how:'Logout session (POST).',params:[{n:'auth',v:'ACCESS_TOKEN'}]},
+{g:'AnimePirates',p:'/ap/health',how:'Site health + supabase + CDN.',params:[]},
+{g:'AnimePirates',p:'/ap/home',how:'Homepage hero + featured/trending/anime/movies sections.',params:[]},
+{g:'AnimePirates',p:'/ap/search',how:'Search titles.',params:[{n:'q',v:'demon'},{n:'category',v:'anime'}]},
+{g:'AnimePirates',p:'/ap/browse',how:'Browse by category anime|movie|series|kdrama.',params:[{n:'category',v:'anime'}]},
+{g:'AnimePirates',p:'/ap/title',how:'Title detail + media/seasons.',params:[{n:'slug',v:'solo-leveling-2024'}]},
+{g:'AnimePirates',p:'/ap/episodes',how:'Episodes list for title_id.',params:[{n:'title_id',v:'bb96dc5a-6132-4599-a07b-969754f32e1e'}]},
+{g:'AnimePirates',p:'/ap/seasons',how:'Seasons for title_id.',params:[{n:'title_id',v:'bb96dc5a-6132-4599-a07b-969754f32e1e'}]},
+{g:'AnimePirates',p:'/ap/media',how:'Quality files (resolution/lang/size/telegram_file_id).',params:[{n:'title_id',v:'bb96dc5a-6132-4599-a07b-969754f32e1e'}]},
+{g:'AnimePirates',p:'/ap/stream',how:'CDN streamUrl (REQUIRES ?auth=TOKEN from login).',params:[{n:'media_id',v:'0000be10-63df-4149-9d7b-85b9d207381e'},{n:'auth',v:'ACCESS_TOKEN'}]},
+{g:'AnimePirates',p:'/ap/download',how:'CDN downloadUrl (REQUIRES ?auth=TOKEN).',params:[{n:'media_id',v:'0000be10-63df-4149-9d7b-85b9d207381e'},{n:'auth',v:'ACCESS_TOKEN'}]},
+{g:'AnimePirates',p:'/ap/trending',how:'Trending titles.',params:[{n:'category',v:'anime'}]},
+{g:'AnimePirates',p:'/ap/featured',how:'Featured titles.',params:[]},
+{g:'AnimePirates',p:'/ap/categories',how:'Category list.',params:[]},
+{g:'AnimePirates',p:'/ap/announcements',how:'Active site announcements.',params:[]},
+{g:'AnimePirates',p:'/ap/ads',how:'Active ads (optional placement).',params:[{n:'placement',v:'homepage_banner'}]},
+{g:'AnimePirates',p:'/ap/rpc/public-browsing',how:'Public browsing RPC flag.',params:[]},
+
 
 {g:'Tools',p:'/tools/pixeldrain',how:'PixelDrain download URL from file id.',params:[{n:'id',v:'GauktM6T'}]},
 {g:'Tools',p:'/tools/mp4',how:'Extract MP4/MKV/M3U8 links from a page.',params:[{n:'url',v:'https://hubcloud.ist/drive/1qg90m0nr2599rq'}]},
