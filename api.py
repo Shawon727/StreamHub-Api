@@ -1,4 +1,5 @@
-# StreamHub API v8.5.0 — creator: shawon (+ Telegram CDN)
+# StreamHub API v8.4.9 — creator: shawon
+# Modules: libretube_api.py (YouTube), telegram_cdn_api.py (/tg CDN, optional Telethon)
 from __future__ import annotations
 
 import asyncio, base64, gzip, hashlib, hmac, json, random, re, time, uuid
@@ -13,35 +14,34 @@ try:
 except ImportError:
     LT = None  # type: ignore
 
+# Optional Telegram CDN module (storage + Range streaming via Telethon)
 try:
-    from telegram_cdn_api import router as tg_router, init_tg_cdn, DATA_DIR as TG_DATA_DIR
-    TG_CDN = True
+    from telegram_cdn_api import router as tg_router, init_tg_cdn
+    _TG_CDN_OK = True
 except ImportError:
     tg_router = None  # type: ignore
     init_tg_cdn = None  # type: ignore
-    TG_DATA_DIR = None
-    TG_CDN = False
+    _TG_CDN_OK = False
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response, StreamingResponse, PlainTextResponse
 
-CREATOR, VERSION = "shawon", "8.5.0"
-app = FastAPI(title="StreamHub API", version=VERSION, docs_url="/docs", redoc_url="/redoc")
+CREATOR, VERSION = "shawon", "8.4.9"
+app = FastAPI(title="StreamHub API", version=VERSION, docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# Telegram CDN routes: /tg/*
-if TG_CDN and tg_router is not None:
+# Mount Telegram CDN routes at /tg/* when module is available
+if _TG_CDN_OK and tg_router is not None:
     app.include_router(tg_router)
-    print(f"[StreamHub] Telegram CDN mounted → /tg/* | data={TG_DATA_DIR}")
 
     @app.on_event("startup")
-    async def _tg_cdn_startup():
-        if init_tg_cdn:
-            try:
+    async def _startup_tg_cdn():
+        try:
+            if init_tg_cdn:
                 await init_tg_cdn()
-            except Exception as e:
-                print(f"[StreamHub] TG CDN startup: {e}")
+        except Exception as e:
+            print(f"[StreamHub] Telegram CDN init deferred: {e}")
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 MOBILE_UA = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36"
@@ -3754,17 +3754,15 @@ async def kt_info():
 
 @app.get("/health", tags=["Meta"])
 async def health():
-    providers = ["moviebox", "4khdhub", "hubcloud", "dramachi", "iptv", "hentaicity", "hindianime", "kartoons", "tools", "aggregate"]
-    if TG_CDN:
-        providers.append("telegram_cdn")
     return ok({
         "version": VERSION,
-        "providers": providers,
-        "telegram_cdn": {
-            "enabled": TG_CDN,
-            "ui": "/tg/ui",
-            "docs": "/tg/health",
-            "data_dir": str(TG_DATA_DIR) if TG_DATA_DIR else None,
+        "providers": [
+            "moviebox", "4khdhub", "hubcloud", "dramachi", "iptv", "hentaicity",
+            "hindianime", "kartoons", "libretube", "animepirates", "telegram_cdn", "tools", "aggregate",
+        ],
+        "modules": {
+            "libretube": LT is not None,
+            "telegram_cdn": _TG_CDN_OK,
         },
     })
 
@@ -5919,6 +5917,13 @@ const E = [
 {g:'Tools',p:'/tools/pixeldrain',how:'PixelDrain download URL from file id.',params:[{n:'id',v:'GauktM6T'}]},
 {g:'Tools',p:'/tools/mp4',how:'Extract MP4/MKV/M3U8 links from a page.',params:[{n:'url',v:'https://hubcloud.ist/drive/1qg90m0nr2599rq'}]},
 {g:'Tools',p:'/tools/cdn-types',how:'Known CDN host patterns.',params:[]},
+{g:'Telegram CDN',p:'/tg/ui',how:'Web UI for Telegram storage CDN.',params:[]},
+{g:'Telegram CDN',p:'/tg/health',how:'TG module health + data dir.',params:[]},
+{g:'Telegram CDN',p:'/tg/setup',how:'Setup steps (API_ID/HASH/bot).',params:[]},
+{g:'Telegram CDN',p:'/tg/videos',how:'List stored videos.',params:[{n:'q',v:''},{n:'limit',v:'50'}]},
+{g:'Telegram CDN',p:'/tg/stream/{id}',how:'Stream with Range (HTTP 206).',params:[]},
+{g:'Telegram CDN',p:'/tg/download/{id}',how:'Download attachment.',params:[]},
+{g:'Telegram CDN',p:'/tg/stats',how:'Library stats.',params:[]},
 {g:'Dramachi',p:'/dr/home',how:'Catalog via search fallback.',params:[{n:'page',v:'1'},{n:'filter',v:'all'}]},
 {g:'Dramachi',p:'/dr/search',how:'Search dramas/movies.',params:[{n:'q',v:'love'},{n:'page',v:'1'},{n:'filter',v:'all'}]},
 {g:'Dramachi',p:'/dr/detail',how:'Metadata only (no public stream CDN).',params:[{n:'id',v:'524'},{n:'content',v:'movies'}]},
